@@ -19,8 +19,9 @@ class KernelConfig:
     bc: int = 128
     mb: int = 16
     clip: float = 1e4
-    wy_eps: float = 1e-3   # NEW: Tikhonov damping for the WY solve (Kernel B)
-
+    wy_eps: float = 0.0          # NEW: Tikhonov damping strength, 0 = off (current behavior)
+    use_centering: bool = False  # NEW: midpoint-centered decay factorization in Kernel A/B4
+   
     @property
     def n_sub(self) -> int:
         return self.bt // self.bc
