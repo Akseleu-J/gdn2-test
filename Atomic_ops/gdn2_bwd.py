@@ -240,7 +240,8 @@ def _dgc_pair_sum(dM, edecay, L, R, clipmask):
 
 
 def _kernel_b4_body(q_ref, k_ref, b_ref, g_ref, daqk_ref, dakk_ref,
-                     dq_ref, dk_ref, db_ref, dgc_ref, *, scale: float, bt: int, bc: int, n_sub: int):
+                     dq_ref, dk_ref, db_ref, dgc_ref, *, scale: float, bt: int, bc: int, n_sub: int,
+                     use_centering: bool):
     q_full = q_ref[0, 0, 0].astype(jnp.float32)
     k_full = k_ref[0, 0, 0].astype(jnp.float32)
     b_full = b_ref[0, 0, 0].astype(jnp.float32)
@@ -259,20 +260,23 @@ def _kernel_b4_body(q_ref, k_ref, b_ref, g_ref, daqk_ref, dakk_ref,
     db_ref[0, 0, 0] = jnp.zeros_like(k_full)
     dgc_ref[0, 0, 0] = jnp.zeros_like(g_raw)
 
+    if use_centering:
+        n_mid = bt // 2
+        gn = gc[n_mid]
+        dgn_acc = jnp.zeros_like(gn)   # accumulated across every sub-block this step
+
     for si in range(n_sub):
         for sj in range(si + 1):
             i0, i1 = si * bc, (si + 1) * bc
             j0, j1 = sj * bc, (sj + 1) * bc
 
             q_i = q_full[i0:i1]
+            k_i = k_full[i0:i1]
             k_j = k_full[j0:j1]
+            b_i = b_full[i0:i1]
             bk_i = bk_full[i0:i1]
             gc_i = gc[i0:i1]
             gc_j = gc[j0:j1]
-
-            decay_diff = gc_i[:, None, :] - gc_j[None, :, :]
-            clipmask = ((decay_diff >= -20.0) & (decay_diff <= 20.0)).astype(jnp.float32)
-            edecay = jnp.exp(jnp.clip(decay_diff, -20.0, 20.0))
 
             dM_qk = dAqk[i0:i1, j0:j1]
             dM_kk = dAkk[i0:i1, j0:j1]
@@ -283,23 +287,65 @@ def _kernel_b4_body(q_ref, k_ref, b_ref, g_ref, daqk_ref, dakk_ref,
                 dM_qk = dM_qk * causal
                 dM_kk = dM_kk * strict
 
-            L_qk = scale * q_i
-            R_qk = k_j
-            dL_qk = _dL_pair_sum(dM_qk, edecay, R_qk)
-            dR_qk = _dR_pair_sum(dM_qk, edecay, L_qk)
-            dgc_i_qk, dgc_j_qk = _dgc_pair_sum(dM_qk, edecay, L_qk, R_qk, clipmask)
+            if use_centering:
+                gq_i_raw = gc_i - gn[None, :]
+                gk_j_raw = gn[None, :] - gc_j
+                gq_i = jnp.clip(gq_i_raw, -20.0, 20.0)
+                gk_j = jnp.clip(gk_j_raw, -20.0, 20.0)
+                clipmask_q = ((gq_i_raw >= -20.0) & (gq_i_raw <= 20.0)).astype(jnp.float32)
+                clipmask_k = ((gk_j_raw >= -20.0) & (gk_j_raw <= 20.0)).astype(jnp.float32)
+                eq_i = jnp.exp(gq_i)
+                ek_j = jnp.exp(gk_j)
+                q_scaled = q_i * eq_i
+                k_scaled = k_j * ek_j
+                bk_scaled = bk_i * eq_i
 
-            L_kk = bk_i
-            R_kk = k_j
-            dL_kk = _dL_pair_sum(dM_kk, edecay, R_kk)
-            dR_kk = _dR_pair_sum(dM_kk, edecay, L_kk)
-            dgc_i_kk, dgc_j_kk = _dgc_pair_sum(dM_kk, edecay, L_kk, R_kk, clipmask)
+                dq_scaled = scale * jnp.dot(dM_qk, k_scaled, precision=_HIGHEST)
+                dk_scaled_qk = scale * jnp.dot(dM_qk.T, q_scaled, precision=_HIGHEST)
+                dbk_scaled = jnp.dot(dM_kk, k_scaled, precision=_HIGHEST)
+                dk_scaled_kk = jnp.dot(dM_kk.T, bk_scaled, precision=_HIGHEST)
+                dk_scaled = dk_scaled_qk + dk_scaled_kk
 
-            dq_ref[0, 0, 0, i0:i1] = clip_acc(dq_ref[0, 0, 0, i0:i1] + dL_qk * scale)
-            db_ref[0, 0, 0, i0:i1] = clip_acc(db_ref[0, 0, 0, i0:i1] + dL_kk)
-            dk_ref[0, 0, 0, j0:j1] = clip_acc(dk_ref[0, 0, 0, j0:j1] + dR_qk + dR_kk)
-            dgc_ref[0, 0, 0, i0:i1] = clip_acc(dgc_ref[0, 0, 0, i0:i1] + dgc_i_qk + dgc_i_kk)
-            dgc_ref[0, 0, 0, j0:j1] = clip_acc(dgc_ref[0, 0, 0, j0:j1] + dgc_j_qk + dgc_j_kk)
+                dk_j_from_scaled = dk_scaled * ek_j
+                dgk_j = (dk_scaled * k_scaled) * clipmask_k
+
+                d_eq_i_total = dq_scaled * q_i + dbk_scaled * bk_i
+                dgq_i = (d_eq_i_total * eq_i) * clipmask_q
+                dq_i_from_scaled = dq_scaled * eq_i
+                dbk_i_from_scaled = dbk_scaled * eq_i   # d(b_i*k_i)
+
+                dq_ref[0, 0, 0, i0:i1] = clip_acc(dq_ref[0, 0, 0, i0:i1] + dq_i_from_scaled * scale / scale)  # keep scale already folded above
+                db_ref[0, 0, 0, i0:i1] = clip_acc(db_ref[0, 0, 0, i0:i1] + dbk_i_from_scaled)
+                dk_ref[0, 0, 0, j0:j1] = clip_acc(dk_ref[0, 0, 0, j0:j1] + dk_j_from_scaled)
+                dgc_ref[0, 0, 0, i0:i1] = clip_acc(dgc_ref[0, 0, 0, i0:i1] + dgq_i)
+                dgc_ref[0, 0, 0, j0:j1] = clip_acc(dgc_ref[0, 0, 0, j0:j1] - dgk_j)
+                dgn_acc = dgn_acc + jnp.sum(dgk_j, axis=0) - jnp.sum(dgq_i, axis=0)
+            else:
+                decay_diff = gc_i[:, None, :] - gc_j[None, :, :]
+                clipmask = ((decay_diff >= -20.0) & (decay_diff <= 20.0)).astype(jnp.float32)
+                edecay = jnp.exp(jnp.clip(decay_diff, -20.0, 20.0))
+
+                L_qk = scale * q_i
+                R_qk = k_j
+                dL_qk = _dL_pair_sum(dM_qk, edecay, R_qk)
+                dR_qk = _dR_pair_sum(dM_qk, edecay, L_qk)
+                dgc_i_qk, dgc_j_qk = _dgc_pair_sum(dM_qk, edecay, L_qk, R_qk, clipmask)
+
+                L_kk = bk_i
+                R_kk = k_j
+                dL_kk = _dL_pair_sum(dM_kk, edecay, R_kk)
+                dR_kk = _dR_pair_sum(dM_kk, edecay, L_kk)
+                dgc_i_kk, dgc_j_kk = _dgc_pair_sum(dM_kk, edecay, L_kk, R_kk, clipmask)
+
+                dq_ref[0, 0, 0, i0:i1] = clip_acc(dq_ref[0, 0, 0, i0:i1] + dL_qk * scale)
+                db_ref[0, 0, 0, i0:i1] = clip_acc(db_ref[0, 0, 0, i0:i1] + dL_kk)
+                dk_ref[0, 0, 0, j0:j1] = clip_acc(dk_ref[0, 0, 0, j0:j1] + dR_qk + dR_kk)
+                dgc_ref[0, 0, 0, i0:i1] = clip_acc(dgc_ref[0, 0, 0, i0:i1] + dgc_i_qk + dgc_i_kk)
+                dgc_ref[0, 0, 0, j0:j1] = clip_acc(dgc_ref[0, 0, 0, j0:j1] + dgc_j_qk + dgc_j_kk)
+
+    if use_centering:
+        n_mid = bt // 2
+        dq_ref[0, 0, 0, i0:i1] = clip_acc(dq_ref[0, 0, 0, i0:i1] + dq_i_from_scaled)
 
     dbk_final = db_ref[0, 0, 0]
     dk_final = dk_ref[0, 0, 0] + dbk_final * b_full
@@ -311,7 +357,6 @@ def _kernel_b4_body(q_ref, k_ref, b_ref, g_ref, daqk_ref, dakk_ref,
     dk_ref[0, 0, 0] = sanitize(dk_final)
     db_ref[0, 0, 0] = sanitize(db_final)
     dgc_ref[0, 0, 0] = sanitize(dgc_final)
-
 
 def intra_backward_pallas(dAqk, dAkk, q, k, b, g, scale, config: KernelConfig = DEFAULT_CONFIG):
     bsz, L, H, D = q.shape
@@ -328,7 +373,8 @@ def intra_backward_pallas(dAqk, dAkk, q, k, b, g, scale, config: KernelConfig = 
 
     dq, dk, db, dgc = pl.pallas_call(
         lambda *refs: _kernel_b4_body(
-            *refs, scale=scale, bt=config.bt, bc=config.bc, n_sub=config.n_sub
+            *refs, scale=scale, bt=config.bt, bc=config.bc, n_sub=config.n_sub,
+            use_centering=config.use_centering,
         ),
         grid=grid,
         in_specs=[io_spec, io_spec, io_spec, io_spec, score_spec, score_spec],
