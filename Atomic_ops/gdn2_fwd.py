@@ -383,7 +383,7 @@ def gdn2_pallas_forward_with_residuals(q, k, v, w, b, g, scale, h0=None,
                                         debug_tag: str = ""):
     bsz, L, H, D, n_chunks = validate_inputs(q, k, v, w, b, g, scale, h0, config)
 
-        Aqk, Akk = build_chunk_scores_pallas(q, k, b, g, scale, config)
+    Aqk, Akk = build_chunk_scores_pallas(q, k, b, g, scale, config)
     Aqk = _stage_diag(f"{debug_tag}:kernel_A_Aqk", Aqk)
     Akk = _stage_diag(f"{debug_tag}:kernel_A_Akk", Akk)
 
