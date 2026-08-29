@@ -91,7 +91,7 @@ def _kernel_a_body(q_ref, k_ref, b_ref, g_ref, aqk_ref, akk_ref, *, scale: float
             akk_ref[0, 0, 0, i0:i1, j0:j1] = sanitize(akk_blk)
 
 
-def build_chunk_scores_pallas(q, k, b, g, scale, config: KernelConfig = DEFAULT_CONFIG):
+def build_chunk_scores_pallas(q, k, b, g, scale, config: KernelConfig = DEFAULT_CONFIG, interpret: bool = False):
     bsz, L, H, D = q.shape
     n_chunks = L // config.bt
     q_r, k_r, b_r, g_r = map(
@@ -115,6 +115,7 @@ def build_chunk_scores_pallas(q, k, b, g, scale, config: KernelConfig = DEFAULT_
             jax.ShapeDtypeStruct((bsz, H, n_chunks, config.bt, config.bt), jnp.float32),
         ],
         compiler_params=pltpu.CompilerParams(vmem_limit_bytes=100 * 1024 * 1024),
+        interpret=interpret,   # <-- ДОБАВИТЬ ЭТУ СТРОКУ
     )(q_r, k_r, b_r, g_r)
     return aqk, akk
 
