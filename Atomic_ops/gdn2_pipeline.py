@@ -112,10 +112,10 @@ def _gdn2_core_bwd(scale, config, residuals, cotangents):
     )
 
     # B4
+    dAkk_undamped = b3_out["dAkk"] * (1.0 - config.wy_eps)   # NEW: chain rule through Akk*(1-wy_eps)
     dq4, dk4, db4, dgc4 = intra_backward_pallas(
-        dAqk, b3_out["dAkk"], q, k, b, g, scale, config
+        dAqk, dAkk_undamped, q, k, b, g, scale, config
     )
-
     # B5
     dgc_total = b3_out["dgc"] + dgc4
     dg_raw = reverse_cumsum_bwd(dgc_total, chunk_size=config.bt)
