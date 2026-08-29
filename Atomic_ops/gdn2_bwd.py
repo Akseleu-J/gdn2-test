@@ -358,7 +358,7 @@ def _kernel_b4_body(q_ref, k_ref, b_ref, g_ref, daqk_ref, dakk_ref,
     db_ref[0, 0, 0] = sanitize(db_final)
     dgc_ref[0, 0, 0] = sanitize(dgc_final)
 
-def intra_backward_pallas(dAqk, dAkk, q, k, b, g, scale, config: KernelConfig = DEFAULT_CONFIG):
+def intra_backward_pallas(dAqk, dAkk, q, k, b, g, scale, config: KernelConfig = DEFAULT_CONFIG, interpret: bool = False):
     bsz, L, H, D = q.shape
     n_chunks = L // config.bt
 
@@ -386,6 +386,7 @@ def intra_backward_pallas(dAqk, dAkk, q, k, b, g, scale, config: KernelConfig = 
             jax.ShapeDtypeStruct((bsz, H, n_chunks, config.bt, D), jnp.float32),
         ],
         compiler_params=pltpu.CompilerParams(vmem_limit_bytes=150 * 1024 * 1024),
+        interpret=interpret,   # <-- ДОБАВИТЬ ЭТУ СТРОКУ
     )(q_r, k_r, b_r, g_r, dAqk, dAkk)
 
     return dq, dk, db, dgc
