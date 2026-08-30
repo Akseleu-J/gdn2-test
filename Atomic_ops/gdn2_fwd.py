@@ -186,6 +186,24 @@ def _block_solve(T_full, config: KernelConfig):
 
 
 def _kernel_b_body(akk_ref, a_ref, *, bt: int, bc: int, config: KernelConfig):
+     # FIX (найдено в Часть 3 grid_bt_bc_condition_diag.py -- bc<bt/2 давал
+    # max|diff vs exact|=1.0 РОВНО, т.е. не численную неточность, а
+    # структурно нулевые блоки): этот top-level 2x2 T00/T11/T10 split
+    # ЖЁСТКО предполагает bt == 2*bc (унаследовано из kernel_b_solve.py,
+    # где это было явным assert'ом -- см. его докстринг "N_SUB=BT//BC=2";
+    # assert потерялся при переносе в этот config-driven файл). При
+    # bc < bt/2 блоки A[2*bc:, :] / A[:, 2*bc:] никогда не записываются и
+    # остаются нулями из инициализации ниже -- выглядит как "решение
+    # ухудшилось", а на деле 3/4 матрицы решения вообще не вычислены.
+    # `bc` здесь -- ТОЛЬКО размер top-level половины chunk'а, не тонкая
+    # настройка точности решателя (эта роль -- у config.mb внутри
+    # _block_solve/_micro_forward_substitution). Явный assert вместо
+    # тихого молчания.
+    assert bt == 2 * bc, (
+        f"Kernel B поддерживает только двухблочный top-level split "
+        f"(bt == 2*bc); получено bt={bt}, bc={bc}. Для варьирования "
+        f"granularity решателя используйте config.mb, а не config.bc."
+    )
     Akk = akk_ref[0, 0, 0].astype(jnp.float32)
     T00 = Akk[0:bc, 0:bc]
     T11 = Akk[bc:2*bc, bc:2*bc]
@@ -207,9 +225,13 @@ def _kernel_b_body(akk_ref, a_ref, *, bt: int, bc: int, config: KernelConfig):
     a_ref[0, 0, 0, bc:2*bc, 0:bc] = A10
     a_ref[0, 0, 0, bc:2*bc, bc:2*bc] = A11
 
-
 def wy_solve_pallas(Akk, config: KernelConfig = DEFAULT_CONFIG):
     bsz, H, n_chunks = Akk.shape[:3]
+    assert config.bt == 2 * config.bc, (
+        f"wy_solve_pallas: bt должен быть == 2*bc (top-level 2-блочный "
+        f"solve), получено bt={config.bt}, bc={config.bc}. Не варьируйте "
+        f"bc независимо от bt -- для granularity решателя есть config.mb."
+    )
     grid = (bsz, H, n_chunks)
     spec = pl.BlockSpec((1, 1, 1, config.bt, config.bt), lambda i, h, c: (i, h, c, 0, 0))
     A = pl.pallas_call(
