@@ -26,6 +26,7 @@ class KernelConfig:
             )
         if self.bc % self.mb != 0:
             raise ValueError(f"bc={self.bc} must be divisible by mb={self.mb}")
+    bt: int = 256
     bc: int = 128
     mb: int = 16
     clip: float = 1e4
