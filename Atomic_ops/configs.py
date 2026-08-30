@@ -15,24 +15,13 @@ _HIGHEST = jax.lax.Precision.HIGHEST
 
 @dc.dataclass(frozen=True)
 class KernelConfig:
-    def __post_init__(self):
-        if self.bt % self.bc != 0:
-            raise ValueError(f"bt={self.bt} must be divisible by bc={self.bc}")
-        if self.bt != 2 * self.bc:
-            raise ValueError(
-                f"bt={self.bt} must equal 2*bc (top-level WY-solve split "
-                f"supports only the 2-block case); got bc={self.bc}. "
-                f"Vary `mb` instead of `bc` to change solver granularity."
-            )
-        if self.bc % self.mb != 0:
-            raise ValueError(f"bc={self.bc} must be divisible by mb={self.mb}")
     bt: int = 256
     bc: int = 128
     mb: int = 16
     clip: float = 1e4
     wy_eps: float = 0.0          # NEW: Tikhonov damping strength, 0 = off (current behavior)
     use_centering: bool = False  # NEW: midpoint-centered decay factorization in Kernel A/B4
-   
+
     @property
     def n_sub(self) -> int:
         return self.bt // self.bc
@@ -44,6 +33,30 @@ class KernelConfig:
     def __post_init__(self):
         if self.bt % self.bc != 0:
             raise ValueError(f"bt={self.bt} must be divisible by bc={self.bc}")
+        # FIX (найдено в grid_bt_bc_condition_diag.py, Часть 3 -- bc<bt/2
+        # давал max|diff vs exact|=1.0 РОВНО, т.е. НЕ численную
+        # неточность, а структурно нулевые блоки): wy_solve_pallas'
+        # top-level solve (Kernel B, _kernel_b_body) реализует ТОЛЬКО
+        # двухблочный split (T00/T11/T10) и жёстко предполагает
+        # bt == 2*bc. При bc < bt/2 три четверти матрицы решения A
+        # никогда не записываются и остаются нулями из инициализации --
+        # это не деградация точности, а отсутствие вычисления вообще.
+        # `bc` НЕ является ручкой точности/устойчивости решателя --
+        # экспериментально подтверждено (grid_bt_bc_condition_diag.py,
+        # Часть 3, повторный корректный прогон), что `mb` (granularity
+        # внутри block-recursive forward substitution) не влияет на
+        # точность решения вообще -- только на скорость. Проверяем
+        # инвариант здесь, чтобы невалидный KernelConfig нельзя было
+        # создать вообще, включая экспериментальные/диагностические
+        # скрипты.
+        if self.bt != 2 * self.bc:
+            raise ValueError(
+                f"bt={self.bt} must equal 2*bc (top-level WY-solve split "
+                f"supports only the 2-block case); got bc={self.bc}. "
+                f"Vary `mb` instead of `bc` to change solver granularity -- "
+                f"bc/mb do not affect numerical accuracy of the solve, only "
+                f"its speed (see grid_bt_bc_condition_diag.py Part 3)."
+            )
         if self.bc % self.mb != 0:
             raise ValueError(f"bc={self.bc} must be divisible by mb={self.mb}")
         if not (0.0 <= self.wy_eps < 1.0):
