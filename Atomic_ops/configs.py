@@ -15,7 +15,17 @@ _HIGHEST = jax.lax.Precision.HIGHEST
 
 @dc.dataclass(frozen=True)
 class KernelConfig:
-    bt: int = 256
+    def __post_init__(self):
+        if self.bt % self.bc != 0:
+            raise ValueError(f"bt={self.bt} must be divisible by bc={self.bc}")
+        if self.bt != 2 * self.bc:
+            raise ValueError(
+                f"bt={self.bt} must equal 2*bc (top-level WY-solve split "
+                f"supports only the 2-block case); got bc={self.bc}. "
+                f"Vary `mb` instead of `bc` to change solver granularity."
+            )
+        if self.bc % self.mb != 0:
+            raise ValueError(f"bc={self.bc} must be divisible by mb={self.mb}")
     bc: int = 128
     mb: int = 16
     clip: float = 1e4
