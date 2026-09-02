@@ -10,7 +10,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from .configs import (
     KernelConfig, DEFAULT_CONFIG, sanitize, sanitize_h0,
-    _stage_diag, validate_inputs,
+    _stage_diag, validate_inputs, clip_scope,
 )
 
 _HIGHEST = jax.lax.Precision.HIGHEST
@@ -102,21 +102,22 @@ def build_chunk_scores_pallas(q, k, b, g, scale, config: KernelConfig = DEFAULT_
     in_spec = pl.BlockSpec((1, 1, 1, config.bt, D), lambda i, h, c: (i, h, c, 0, 0))
     out_spec = pl.BlockSpec((1, 1, 1, config.bt, config.bt), lambda i, h, c: (i, h, c, 0, 0))
 
-    aqk, akk = pl.pallas_call(
-        lambda *refs: _kernel_a_body(
-            *refs, scale=scale, bt=config.bt, bc=config.bc, n_sub=config.n_sub,
-            use_centering=config.use_centering,
-        ),
-        grid=grid,
-        in_specs=[in_spec, in_spec, in_spec, in_spec],
-        out_specs=[out_spec, out_spec],
-        out_shape=[
-            jax.ShapeDtypeStruct((bsz, H, n_chunks, config.bt, config.bt), jnp.float32),
-            jax.ShapeDtypeStruct((bsz, H, n_chunks, config.bt, config.bt), jnp.float32),
-        ],
-        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=100 * 1024 * 1024),
-        interpret=interpret,
-    )(q_r, k_r, b_r, g_r)
+    with clip_scope(config):
+        aqk, akk = pl.pallas_call(
+            lambda *refs: _kernel_a_body(
+                *refs, scale=scale, bt=config.bt, bc=config.bc, n_sub=config.n_sub,
+                use_centering=config.use_centering,
+            ),
+            grid=grid,
+            in_specs=[in_spec, in_spec, in_spec, in_spec],
+            out_specs=[out_spec, out_spec],
+            out_shape=[
+                jax.ShapeDtypeStruct((bsz, H, n_chunks, config.bt, config.bt), jnp.float32),
+                jax.ShapeDtypeStruct((bsz, H, n_chunks, config.bt, config.bt), jnp.float32),
+            ],
+            compiler_params=pltpu.CompilerParams(vmem_limit_bytes=100 * 1024 * 1024),
+            interpret=interpret,
+        )(q_r, k_r, b_r, g_r)
     return aqk, akk
 
 
@@ -228,14 +229,15 @@ def wy_solve_pallas(Akk, config: KernelConfig = DEFAULT_CONFIG):
     )
     grid = (bsz, H, n_chunks)
     spec = pl.BlockSpec((1, 1, 1, config.bt, config.bt), lambda i, h, c: (i, h, c, 0, 0))
-    A = pl.pallas_call(
-        lambda *refs: _kernel_b_body(*refs, bt=config.bt, bc=config.bc, config=config),
-        grid=grid,
-        in_specs=[spec],
-        out_specs=spec,
-        out_shape=jax.ShapeDtypeStruct(Akk.shape, jnp.float32),
-        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=96 * 1024 * 1024),
-    )(Akk)
+    with clip_scope(config):
+        A = pl.pallas_call(
+            lambda *refs: _kernel_b_body(*refs, bt=config.bt, bc=config.bc, config=config),
+            grid=grid,
+            in_specs=[spec],
+            out_specs=spec,
+            out_shape=jax.ShapeDtypeStruct(Akk.shape, jnp.float32),
+            compiler_params=pltpu.CompilerParams(vmem_limit_bytes=96 * 1024 * 1024),
+        )(Akk)
     return A
 
 
@@ -288,20 +290,21 @@ def recompute_wy_pallas(q, k, v, w, b, g, A, config: KernelConfig = DEFAULT_CONF
     a_spec = pl.BlockSpec((1, 1, 1, config.bt, config.bt), lambda i, h, c: (i, h, c, 0, 0))
     gclast_spec = pl.BlockSpec((1, 1, 1, 1, D), lambda i, h, c: (i, h, c, 0, 0))
 
-    w_pseudo, u, kg, qg, gc_last = pl.pallas_call(
-        lambda *refs: _kernel_c_body(*refs, bt=config.bt),
-        grid=grid,
-        in_specs=[io_spec, io_spec, io_spec, io_spec, io_spec, io_spec, a_spec],
-        out_specs=[io_spec, io_spec, io_spec, io_spec, gclast_spec],
-        out_shape=[
-            jax.ShapeDtypeStruct((bsz, H, n_chunks, config.bt, D), jnp.float32),
-            jax.ShapeDtypeStruct((bsz, H, n_chunks, config.bt, D), jnp.float32),
-            jax.ShapeDtypeStruct((bsz, H, n_chunks, config.bt, D), jnp.float32),
-            jax.ShapeDtypeStruct((bsz, H, n_chunks, config.bt, D), jnp.float32),
-            jax.ShapeDtypeStruct((bsz, H, n_chunks, 1, D), jnp.float32),
-        ],
-        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=64 * 1024 * 1024),
-    )(q_r, k_r, v_r, w_r, b_r, g_r, A)
+    with clip_scope(config):
+        w_pseudo, u, kg, qg, gc_last = pl.pallas_call(
+            lambda *refs: _kernel_c_body(*refs, bt=config.bt),
+            grid=grid,
+            in_specs=[io_spec, io_spec, io_spec, io_spec, io_spec, io_spec, a_spec],
+            out_specs=[io_spec, io_spec, io_spec, io_spec, gclast_spec],
+            out_shape=[
+                jax.ShapeDtypeStruct((bsz, H, n_chunks, config.bt, D), jnp.float32),
+                jax.ShapeDtypeStruct((bsz, H, n_chunks, config.bt, D), jnp.float32),
+                jax.ShapeDtypeStruct((bsz, H, n_chunks, config.bt, D), jnp.float32),
+                jax.ShapeDtypeStruct((bsz, H, n_chunks, config.bt, D), jnp.float32),
+                jax.ShapeDtypeStruct((bsz, H, n_chunks, 1, D), jnp.float32),
+            ],
+            compiler_params=pltpu.CompilerParams(vmem_limit_bytes=64 * 1024 * 1024),
+        )(q_r, k_r, v_r, w_r, b_r, g_r, A)
 
     gc_last = gc_last.reshape(bsz, H, n_chunks, D)
     return w_pseudo, u, kg, qg, gc_last
@@ -313,7 +316,7 @@ def gdn2_inter_chunk_combine(Aqk, w_pseudo, u, kg, qg, gc_last, scale, h0=None,
     bsz, H, n_chunks, _BT, D = w_pseudo.shape
     if h0 is None:
         h0 = jnp.zeros((bsz, H, D, D), dtype=jnp.float32)
-    h0 = sanitize_h0(h0)
+    h0 = sanitize_h0(h0, config)
 
     to_scan = tuple(jnp.moveaxis(x, 2, 0) for x in (Aqk, w_pseudo, u, kg, qg, gc_last))
 
@@ -332,7 +335,8 @@ def gdn2_inter_chunk_combine(Aqk, w_pseudo, u, kg, qg, gc_last, scale, h0=None,
         o_c = sanitize(o_c)
         return h_new, o_c
 
-    h_final, o_scanned = jax.lax.scan(step, h0, to_scan)
+    with clip_scope(config):
+        h_final, o_scanned = jax.lax.scan(step, h0, to_scan)
     h_final = _stage_diag(f"{debug_tag}:kernel_D_h_final", h_final)
     o = jnp.moveaxis(o_scanned, 0, 2)
     o = _stage_diag(f"{debug_tag}:kernel_D_o", o)
@@ -345,7 +349,7 @@ def gdn2_inter_chunk_combine_with_state(Aqk, w_pseudo, u, kg, qg, gc_last, scale
     bsz, H, n_chunks, _BT, D = w_pseudo.shape
     if h0 is None:
         h0 = jnp.zeros((bsz, H, D, D), dtype=jnp.float32)
-    h0 = sanitize_h0(h0)
+    h0 = sanitize_h0(h0, config)
 
     to_scan = tuple(jnp.moveaxis(x, 2, 0) for x in (Aqk, w_pseudo, u, kg, qg, gc_last))
 
@@ -364,7 +368,8 @@ def gdn2_inter_chunk_combine_with_state(Aqk, w_pseudo, u, kg, qg, gc_last, scale
         o_c = sanitize(o_c)
         return h_new, (o_c, h_pre, v_new)
 
-    h_final, (o_scanned, h_pre_all, v_new_all) = jax.lax.scan(step, h0, to_scan)
+    with clip_scope(config):
+        h_final, (o_scanned, h_pre_all, v_new_all) = jax.lax.scan(step, h0, to_scan)
     h_final = _stage_diag(f"{debug_tag}:kernel_D_h_final", h_final)
     o = jnp.moveaxis(o_scanned, 0, 2)
     o = _stage_diag(f"{debug_tag}:kernel_D_o", o)
