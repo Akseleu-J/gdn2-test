@@ -9,7 +9,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from .configs import (
-    KernelConfig, DEFAULT_CONFIG, sanitize, clip_acc,
+    KernelConfig, DEFAULT_CONFIG, sanitize, clip_acc, clip_scope,
     _reshape_to_chunks as _r2c, _reshape_from_chunks as _r2f,
 )
 
@@ -26,11 +26,17 @@ def reverse_cumsum_bwd(dgc, chunk_size: int):
 
 
 # ---------- B1 ----------
-def gdn2_dhu_backward(do, dv_partial, w_pseudo, qg, kg, gc_last, scale, dht=None):
+def gdn2_dhu_backward(do, dv_partial, w_pseudo, qg, kg, gc_last, scale, dht=None,
+                       config: KernelConfig = DEFAULT_CONFIG):
+    # FIX: `config` was missing entirely from this function's signature,
+    # so every sanitize()/clip_acc() call inside it (and the reverse scan
+    # below) silently clipped to DEFAULT_CONFIG.clip regardless of which
+    # config the caller (gdn2_pipeline.py's _gdn2_core_bwd) was actually
+    # using. Now threaded through like every other backward entry point.
     bsz, H, n_chunks, BT, D = qg.shape
     if dht is None:
         dht = jnp.zeros((bsz, H, D, D), dtype=jnp.float32)
-    dht = sanitize(dht)
+    dht = sanitize(dht, config)
 
     to_scan = tuple(jnp.moveaxis(x, 2, 0) for x in (do, dv_partial, w_pseudo, qg, kg, gc_last))
 
@@ -44,15 +50,16 @@ def gdn2_dhu_backward(do, dv_partial, w_pseudo, qg, kg, gc_last, scale, dht=None
 
         dv_write = jnp.einsum("bhid,bhdv->bhiv", kg_c, dh_carry, precision=_HIGHEST)
         dv_new_c = dvp_c + dv_write
-        dv_new_c = sanitize(dv_new_c)
+        dv_new_c = sanitize(dv_new_c, config)
 
         contrib_from_vnew = -jnp.einsum("bhjd,bhjv->bhdv", wp_c, dv_new_c, precision=_HIGHEST)
 
         dh_pre_c = contrib_from_output + contrib_from_state + contrib_from_vnew
-        dh_pre_c = sanitize(dh_pre_c)
+        dh_pre_c = sanitize(dh_pre_c, config)
         return dh_pre_c, (dh_pre_c, dv_new_c)
 
-    dh0, (dh_all_rev, dv_all_rev) = jax.lax.scan(step, dht, to_scan, reverse=True)
+    with clip_scope(config):
+        dh0, (dh_all_rev, dv_all_rev) = jax.lax.scan(step, dht, to_scan, reverse=True)
     dh_all = jnp.moveaxis(dh_all_rev, 0, 2)
     dv_all = jnp.moveaxis(dv_all_rev, 0, 2)
     return dh_all, dh0, dv_all
@@ -80,17 +87,18 @@ def dav_backward_pallas(Aqk, v_new, do, config: KernelConfig = DEFAULT_CONFIG):
     aqk_spec = pl.BlockSpec((1, 1, 1, config.bt, config.bt), lambda i, h, c: (i, h, c, 0, 0))
     io_spec = pl.BlockSpec((1, 1, 1, config.bt, D), lambda i, h, c: (i, h, c, 0, 0))
 
-    dAqk, dv_new = pl.pallas_call(
-        lambda *refs: _kernel_b2_body(*refs, bt=config.bt),
-        grid=grid,
-        in_specs=[aqk_spec, io_spec, io_spec],
-        out_specs=[aqk_spec, io_spec],
-        out_shape=[
-            jax.ShapeDtypeStruct(Aqk.shape, jnp.float32),
-            jax.ShapeDtypeStruct(v_new.shape, jnp.float32),
-        ],
-        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=64 * 1024 * 1024),
-    )(Aqk, v_new, do)
+    with clip_scope(config):
+        dAqk, dv_new = pl.pallas_call(
+            lambda *refs: _kernel_b2_body(*refs, bt=config.bt),
+            grid=grid,
+            in_specs=[aqk_spec, io_spec, io_spec],
+            out_specs=[aqk_spec, io_spec],
+            out_shape=[
+                jax.ShapeDtypeStruct(Aqk.shape, jnp.float32),
+                jax.ShapeDtypeStruct(v_new.shape, jnp.float32),
+            ],
+            compiler_params=pltpu.CompilerParams(vmem_limit_bytes=64 * 1024 * 1024),
+        )(Aqk, v_new, do)
     return dAqk, dv_new
 
 
@@ -198,23 +206,24 @@ def wy_dqkg_backward_pallas(q, k, b, w, v, gc, A, Akk, h_pre_all, v_new_all,
     score_spec = pl.BlockSpec((1, 1, 1, config.bt, config.bt), lambda i, h, c: (i, h, c, 0, 0))
     h_spec = pl.BlockSpec((1, 1, 1, D, D), lambda i, h, c: (i, h, c, 0, 0))
 
-    dq, dk, db, dw, dv_raw, dgc, dAkk = pl.pallas_call(
-        lambda *refs: _kernel_b3_body(*refs, scale=scale, bt=config.bt, wy_eps=config.wy_eps),
-        grid=grid,
-        in_specs=[io_spec, io_spec, io_spec, io_spec, io_spec, io_spec,
-                   score_spec, score_spec, h_spec, io_spec, io_spec, io_spec, h_spec],
-        out_specs=[io_spec, io_spec, io_spec, io_spec, io_spec, io_spec, score_spec],
-        out_shape=[
-            jax.ShapeDtypeStruct((bsz, H, n_chunks, config.bt, D), jnp.float32),
-            jax.ShapeDtypeStruct((bsz, H, n_chunks, config.bt, D), jnp.float32),
-            jax.ShapeDtypeStruct((bsz, H, n_chunks, config.bt, D), jnp.float32),
-            jax.ShapeDtypeStruct((bsz, H, n_chunks, config.bt, D), jnp.float32),
-            jax.ShapeDtypeStruct((bsz, H, n_chunks, config.bt, D), jnp.float32),
-            jax.ShapeDtypeStruct((bsz, H, n_chunks, config.bt, D), jnp.float32),
-            jax.ShapeDtypeStruct((bsz, H, n_chunks, config.bt, config.bt), jnp.float32),
-        ],
-        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=100 * 1024 * 1024),
-    )(q, k, b, w, v, gc, A, Akk, h_pre_all, v_new_all, do, dv, dh_next_all)
+    with clip_scope(config):
+        dq, dk, db, dw, dv_raw, dgc, dAkk = pl.pallas_call(
+            lambda *refs: _kernel_b3_body(*refs, scale=scale, bt=config.bt, wy_eps=config.wy_eps),
+            grid=grid,
+            in_specs=[io_spec, io_spec, io_spec, io_spec, io_spec, io_spec,
+                       score_spec, score_spec, h_spec, io_spec, io_spec, io_spec, h_spec],
+            out_specs=[io_spec, io_spec, io_spec, io_spec, io_spec, io_spec, score_spec],
+            out_shape=[
+                jax.ShapeDtypeStruct((bsz, H, n_chunks, config.bt, D), jnp.float32),
+                jax.ShapeDtypeStruct((bsz, H, n_chunks, config.bt, D), jnp.float32),
+                jax.ShapeDtypeStruct((bsz, H, n_chunks, config.bt, D), jnp.float32),
+                jax.ShapeDtypeStruct((bsz, H, n_chunks, config.bt, D), jnp.float32),
+                jax.ShapeDtypeStruct((bsz, H, n_chunks, config.bt, D), jnp.float32),
+                jax.ShapeDtypeStruct((bsz, H, n_chunks, config.bt, D), jnp.float32),
+                jax.ShapeDtypeStruct((bsz, H, n_chunks, config.bt, config.bt), jnp.float32),
+            ],
+            compiler_params=pltpu.CompilerParams(vmem_limit_bytes=100 * 1024 * 1024),
+        )(q, k, b, w, v, gc, A, Akk, h_pre_all, v_new_all, do, dv, dh_next_all)
 
     return dict(dq=dq, dk=dk, db=db, dw=dw, dv_raw=dv_raw, dgc=dgc, dAkk=dAkk)
 
