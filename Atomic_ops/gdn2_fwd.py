@@ -10,7 +10,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from .configs import (
     KernelConfig, DEFAULT_CONFIG, sanitize, sanitize_h0,
-    _stage_diag, validate_inputs, clip_scope,
+    _stage_diag, validate_inputs,
 )
 
 _HIGHEST = jax.lax.Precision.HIGHEST
@@ -102,22 +102,21 @@ def build_chunk_scores_pallas(q, k, b, g, scale, config: KernelConfig = DEFAULT_
     in_spec = pl.BlockSpec((1, 1, 1, config.bt, D), lambda i, h, c: (i, h, c, 0, 0))
     out_spec = pl.BlockSpec((1, 1, 1, config.bt, config.bt), lambda i, h, c: (i, h, c, 0, 0))
 
-    with clip_scope(config):
-        aqk, akk = pl.pallas_call(
-            lambda *refs: _kernel_a_body(
-                *refs, scale=scale, bt=config.bt, bc=config.bc, n_sub=config.n_sub,
-                use_centering=config.use_centering,
-            ),
-            grid=grid,
-            in_specs=[in_spec, in_spec, in_spec, in_spec],
-            out_specs=[out_spec, out_spec],
-            out_shape=[
-                jax.ShapeDtypeStruct((bsz, H, n_chunks, config.bt, config.bt), jnp.float32),
-                jax.ShapeDtypeStruct((bsz, H, n_chunks, config.bt, config.bt), jnp.float32),
-            ],
-            compiler_params=pltpu.CompilerParams(vmem_limit_bytes=100 * 1024 * 1024),
-            interpret=interpret,
-        )(q_r, k_r, b_r, g_r)
+    aqk, akk = pl.pallas_call(
+        lambda *refs: _kernel_a_body(
+            *refs, scale=scale, bt=config.bt, bc=config.bc, n_sub=config.n_sub,
+            use_centering=config.use_centering,
+        ),
+        grid=grid,
+        in_specs=[in_spec, in_spec, in_spec, in_spec],
+        out_specs=[out_spec, out_spec],
+        out_shape=[
+            jax.ShapeDtypeStruct((bsz, H, n_chunks, config.bt, config.bt), jnp.float32),
+            jax.ShapeDtypeStruct((bsz, H, n_chunks, config.bt, config.bt), jnp.float32),
+        ],
+        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=100 * 1024 * 1024),
+        interpret=interpret,
+    )(q_r, k_r, b_r, g_r)
     return aqk, akk
 
 
@@ -175,20 +174,9 @@ def _block_solve(T_full, config: KernelConfig):
 
 
 def _kernel_b_body(akk_ref, a_ref, *, bt: int, bc: int, config: KernelConfig):
-    # FIX (найдено в grid_bt_bc_condition_diag.py, Часть 3 -- bc<bt/2
-    # давал max|diff vs exact|=1.0 РОВНО, т.е. НЕ численную неточность,
-    # а структурно нулевые блоки): этот top-level 2x2 T00/T11/T10 split
-    # ЖЁСТКО предполагает bt == 2*bc (унаследовано из kernel_b_solve.py,
-    # где это было явным assert'ом -- см. его докстринг "N_SUB=BT//BC=2";
-    # assert потерялся при переносе в этот config-driven файл). При
-    # bc < bt/2 блоки A[2*bc:, :] / A[:, 2*bc:] никогда не записываются
-    # и остаются нулями из инициализации ниже. `bc` здесь -- ТОЛЬКО
-    # размер top-level половины chunk'а, не тонкая настройка точности
-    # решателя (эта роль -- у config.mb внутри _block_solve). Экспери-
-    # ментально подтверждено (та же диагностика, Часть 3, корректный
-    # повторный прогон): mb не влияет на точность решения вообще, только
-    # на скорость -- поэтому единственный валидный способ варьировать
-    # решатель это mb, не bc.
+    # NOTE: this top-level 2x2 T00/T11/T10 split hard-assumes bt == 2*bc
+    # (see KernelConfig.__post_init__, which enforces this invariant at
+    # construction time -- the earliest of three lines of defense).
     assert bt == 2 * bc, (
         f"Kernel B поддерживает только двухблочный top-level split "
         f"(bt == 2*bc); получено bt={bt}, bc={bc}. Для варьирования "
@@ -202,6 +190,15 @@ def _kernel_b_body(akk_ref, a_ref, *, bt: int, bc: int, config: KernelConfig):
     A00 = _block_solve(T00, config)
     A11 = _block_solve(T11, config)
 
+    # NOTE: the (1-eps) damping here is the ONLY place damping is applied
+    # to Akk in the whole forward path. It is baked into _block_solve /
+    # _micro_forward_substitution as well as this top-level T10 cross
+    # term, so this single call is what "A = (I + (1-wy_eps)*Akk)^-1"
+    # (as documented in gdn2_bwd.py's B3 comment) actually refers to.
+    # Callers (build_chunk_scores_pallas -> wy_solve_pallas) must pass
+    # the RAW, undamped Akk -- do not pre-damp Akk before calling
+    # wy_solve_pallas, or the effective damping becomes (1-eps)^2 and
+    # silently diverges from what B3's backward assumes.
     eps = config.wy_eps
     tmp = jnp.dot(T10 * (1.0 - eps), A00, precision=_HIGHEST)
     tmp = sanitize(tmp)
@@ -215,13 +212,17 @@ def _kernel_b_body(akk_ref, a_ref, *, bt: int, bc: int, config: KernelConfig):
 
 
 def wy_solve_pallas(Akk, config: KernelConfig = DEFAULT_CONFIG):
+    """Solves A = (I + (1 - config.wy_eps) * Akk)^-1 via block-recursive
+    WY forward substitution. `Akk` must be the RAW (undamped) matrix from
+    build_chunk_scores_pallas -- damping is applied exactly once, inside
+    this function (see _kernel_b_body / _block_solve). Do NOT pre-damp
+    Akk before calling this (that was a bug: see gdn2_pallas_forward_with_residuals
+    history -- pre-damping here caused an effective (1-wy_eps)^2 solve
+    that silently diverged from the inference-only gdn2_pallas_forward
+    path and from what the B3 backward kernel assumes)."""
     bsz, H, n_chunks = Akk.shape[:3]
-    # FIX: та же проверка, что и внутри _kernel_b_body -- дублируется
-    # здесь намеренно, чтобы падать ДО трейсинга/компиляции Pallas-кернела
-    # (при jit/vmap ошибка внутри _kernel_b_body может всплыть менее
-    # прозрачно). configs.py's KernelConfig.__post_init__ также проверяет
-    # этот инвариант при СОЗДАНИИ конфига -- это третья, самая ранняя
-    # линия защиты.
+    # NOTE: та же проверка, что и внутри _kernel_b_body -- дублируется
+    # здесь намеренно, чтобы падать ДО трейсинга/компиляции Pallas-кернела.
     assert config.bt == 2 * config.bc, (
         f"wy_solve_pallas: bt должен быть == 2*bc (top-level 2-блочный "
         f"solve), получено bt={config.bt}, bc={config.bc}. Не варьируйте "
@@ -229,15 +230,14 @@ def wy_solve_pallas(Akk, config: KernelConfig = DEFAULT_CONFIG):
     )
     grid = (bsz, H, n_chunks)
     spec = pl.BlockSpec((1, 1, 1, config.bt, config.bt), lambda i, h, c: (i, h, c, 0, 0))
-    with clip_scope(config):
-        A = pl.pallas_call(
-            lambda *refs: _kernel_b_body(*refs, bt=config.bt, bc=config.bc, config=config),
-            grid=grid,
-            in_specs=[spec],
-            out_specs=spec,
-            out_shape=jax.ShapeDtypeStruct(Akk.shape, jnp.float32),
-            compiler_params=pltpu.CompilerParams(vmem_limit_bytes=96 * 1024 * 1024),
-        )(Akk)
+    A = pl.pallas_call(
+        lambda *refs: _kernel_b_body(*refs, bt=config.bt, bc=config.bc, config=config),
+        grid=grid,
+        in_specs=[spec],
+        out_specs=spec,
+        out_shape=jax.ShapeDtypeStruct(Akk.shape, jnp.float32),
+        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=96 * 1024 * 1024),
+    )(Akk)
     return A
 
 
@@ -290,21 +290,20 @@ def recompute_wy_pallas(q, k, v, w, b, g, A, config: KernelConfig = DEFAULT_CONF
     a_spec = pl.BlockSpec((1, 1, 1, config.bt, config.bt), lambda i, h, c: (i, h, c, 0, 0))
     gclast_spec = pl.BlockSpec((1, 1, 1, 1, D), lambda i, h, c: (i, h, c, 0, 0))
 
-    with clip_scope(config):
-        w_pseudo, u, kg, qg, gc_last = pl.pallas_call(
-            lambda *refs: _kernel_c_body(*refs, bt=config.bt),
-            grid=grid,
-            in_specs=[io_spec, io_spec, io_spec, io_spec, io_spec, io_spec, a_spec],
-            out_specs=[io_spec, io_spec, io_spec, io_spec, gclast_spec],
-            out_shape=[
-                jax.ShapeDtypeStruct((bsz, H, n_chunks, config.bt, D), jnp.float32),
-                jax.ShapeDtypeStruct((bsz, H, n_chunks, config.bt, D), jnp.float32),
-                jax.ShapeDtypeStruct((bsz, H, n_chunks, config.bt, D), jnp.float32),
-                jax.ShapeDtypeStruct((bsz, H, n_chunks, config.bt, D), jnp.float32),
-                jax.ShapeDtypeStruct((bsz, H, n_chunks, 1, D), jnp.float32),
-            ],
-            compiler_params=pltpu.CompilerParams(vmem_limit_bytes=64 * 1024 * 1024),
-        )(q_r, k_r, v_r, w_r, b_r, g_r, A)
+    w_pseudo, u, kg, qg, gc_last = pl.pallas_call(
+        lambda *refs: _kernel_c_body(*refs, bt=config.bt),
+        grid=grid,
+        in_specs=[io_spec, io_spec, io_spec, io_spec, io_spec, io_spec, a_spec],
+        out_specs=[io_spec, io_spec, io_spec, io_spec, gclast_spec],
+        out_shape=[
+            jax.ShapeDtypeStruct((bsz, H, n_chunks, config.bt, D), jnp.float32),
+            jax.ShapeDtypeStruct((bsz, H, n_chunks, config.bt, D), jnp.float32),
+            jax.ShapeDtypeStruct((bsz, H, n_chunks, config.bt, D), jnp.float32),
+            jax.ShapeDtypeStruct((bsz, H, n_chunks, config.bt, D), jnp.float32),
+            jax.ShapeDtypeStruct((bsz, H, n_chunks, 1, D), jnp.float32),
+        ],
+        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=64 * 1024 * 1024),
+    )(q_r, k_r, v_r, w_r, b_r, g_r, A)
 
     gc_last = gc_last.reshape(bsz, H, n_chunks, D)
     return w_pseudo, u, kg, qg, gc_last
@@ -316,7 +315,7 @@ def gdn2_inter_chunk_combine(Aqk, w_pseudo, u, kg, qg, gc_last, scale, h0=None,
     bsz, H, n_chunks, _BT, D = w_pseudo.shape
     if h0 is None:
         h0 = jnp.zeros((bsz, H, D, D), dtype=jnp.float32)
-    h0 = sanitize_h0(h0, config)
+    h0 = sanitize_h0(h0)
 
     to_scan = tuple(jnp.moveaxis(x, 2, 0) for x in (Aqk, w_pseudo, u, kg, qg, gc_last))
 
@@ -335,8 +334,7 @@ def gdn2_inter_chunk_combine(Aqk, w_pseudo, u, kg, qg, gc_last, scale, h0=None,
         o_c = sanitize(o_c)
         return h_new, o_c
 
-    with clip_scope(config):
-        h_final, o_scanned = jax.lax.scan(step, h0, to_scan)
+    h_final, o_scanned = jax.lax.scan(step, h0, to_scan)
     h_final = _stage_diag(f"{debug_tag}:kernel_D_h_final", h_final)
     o = jnp.moveaxis(o_scanned, 0, 2)
     o = _stage_diag(f"{debug_tag}:kernel_D_o", o)
@@ -349,7 +347,7 @@ def gdn2_inter_chunk_combine_with_state(Aqk, w_pseudo, u, kg, qg, gc_last, scale
     bsz, H, n_chunks, _BT, D = w_pseudo.shape
     if h0 is None:
         h0 = jnp.zeros((bsz, H, D, D), dtype=jnp.float32)
-    h0 = sanitize_h0(h0, config)
+    h0 = sanitize_h0(h0)
 
     to_scan = tuple(jnp.moveaxis(x, 2, 0) for x in (Aqk, w_pseudo, u, kg, qg, gc_last))
 
@@ -368,8 +366,7 @@ def gdn2_inter_chunk_combine_with_state(Aqk, w_pseudo, u, kg, qg, gc_last, scale
         o_c = sanitize(o_c)
         return h_new, (o_c, h_pre, v_new)
 
-    with clip_scope(config):
-        h_final, (o_scanned, h_pre_all, v_new_all) = jax.lax.scan(step, h0, to_scan)
+    h_final, (o_scanned, h_pre_all, v_new_all) = jax.lax.scan(step, h0, to_scan)
     h_final = _stage_diag(f"{debug_tag}:kernel_D_h_final", h_final)
     o = jnp.moveaxis(o_scanned, 0, 2)
     o = _stage_diag(f"{debug_tag}:kernel_D_o", o)
@@ -409,8 +406,18 @@ def gdn2_pallas_forward_with_residuals(q, k, v, w, b, g, scale, h0=None,
     Aqk = _stage_diag(f"{debug_tag}:kernel_A_Aqk", Aqk)
     Akk = _stage_diag(f"{debug_tag}:kernel_A_Akk", Akk)
 
-    Akk_damped = Akk * (1.0 - config.wy_eps)
-    A = wy_solve_pallas(Akk_damped, config)
+    # FIX (double-damping bug): wy_solve_pallas already applies
+    # (1 - config.wy_eps) damping internally (see _kernel_b_body /
+    # _block_solve). Pre-damping Akk here as well used to make this
+    # trainable path solve (I + (1-wy_eps)^2 * Akk)^-1 instead of the
+    # documented (I + (1-wy_eps) * Akk)^-1 -- silently diverging from
+    # gdn2_pallas_forward (the inference-only path, which passes Akk
+    # through undamped) on the exact same inputs. Pass the RAW Akk here
+    # too, so both forward entry points solve the identical system and
+    # gdn2_pallas_forward_trainable's primal output matches
+    # gdn2_pallas_forward bit-for-bit (see
+    # test_forward_and_trainable_forward_agree_exactly).
+    A = wy_solve_pallas(Akk, config)
     A = _stage_diag(f"{debug_tag}:kernel_B_wy_inverse_A", A)
 
     w_pseudo, u, kg, qg, gc_last = recompute_wy_pallas(q, k, v, w, b, g, A, config)
@@ -428,6 +435,9 @@ def gdn2_pallas_forward_with_residuals(q, k, v, w, b, g, scale, h0=None,
     o = _reshape_from_chunks(o_chunks, bsz, n_chunks, config.bt, H, D)
 
     residuals = {
+        # NOTE: "Akk" here is the RAW (undamped) matrix, matching what
+        # _kernel_b3_body's backward expects (it applies the single
+        # (1-wy_eps) chain-rule factor itself -- see gdn2_bwd.py).
         "Aqk": Aqk, "Akk": Akk, "A": A,
         "h_pre_all": h_pre_all, "v_new_all": v_new_all,
         "w_pseudo": w_pseudo, "u": u, "kg": kg, "qg": qg, "gc_last": gc_last,
