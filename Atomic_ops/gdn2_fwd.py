@@ -1,5 +1,12 @@
 """
 Forward kernels: A (scores) -> B (WY solve) -> C (recompute) -> D (inter-chunk scan).
+
+PATCH (clip-plumbing fix): every sanitize()/clip_acc() call site inside the
+Pallas kernel bodies now explicitly passes `config`, so that KernelConfig.clip
+(e.g. KAGGLE_LARGE.clip=5e3 vs DEFAULT_CONFIG.clip=1e4) is actually honored
+instead of silently falling back to sanitize()'s Python default argument
+(DEFAULT_CONFIG). See test_clip_config_plumbing.py for the regression test
+this fixes.
 """
 from __future__ import annotations
 
@@ -34,7 +41,8 @@ def _weighted_pair_sum(a_i, edecay, b_j):
     return jnp.sum(tmp, axis=-1)
 
 
-def _kernel_a_body(q_ref, k_ref, b_ref, g_ref, aqk_ref, akk_ref, *, scale: float, bt: int, bc: int, n_sub: int, use_centering: bool):
+def _kernel_a_body(q_ref, k_ref, b_ref, g_ref, aqk_ref, akk_ref, *, scale: float, bt: int, bc: int,
+                    n_sub: int, use_centering: bool, config: KernelConfig):
     q_full = q_ref[0, 0, 0].astype(jnp.float32)
     k_full = k_ref[0, 0, 0].astype(jnp.float32)
     b_full = b_ref[0, 0, 0].astype(jnp.float32)
@@ -87,8 +95,8 @@ def _kernel_a_body(q_ref, k_ref, b_ref, g_ref, aqk_ref, akk_ref, *, scale: float
                 aqk_blk = aqk_blk * causal
                 akk_blk = akk_blk * strict
 
-            aqk_ref[0, 0, 0, i0:i1, j0:j1] = sanitize(aqk_blk)
-            akk_ref[0, 0, 0, i0:i1, j0:j1] = sanitize(akk_blk)
+            aqk_ref[0, 0, 0, i0:i1, j0:j1] = sanitize(aqk_blk, config)
+            akk_ref[0, 0, 0, i0:i1, j0:j1] = sanitize(akk_blk, config)
 
 
 def build_chunk_scores_pallas(q, k, b, g, scale, config: KernelConfig = DEFAULT_CONFIG, interpret: bool = False):
@@ -105,7 +113,7 @@ def build_chunk_scores_pallas(q, k, b, g, scale, config: KernelConfig = DEFAULT_
     aqk, akk = pl.pallas_call(
         lambda *refs: _kernel_a_body(
             *refs, scale=scale, bt=config.bt, bc=config.bc, n_sub=config.n_sub,
-            use_centering=config.use_centering,
+            use_centering=config.use_centering, config=config,
         ),
         grid=grid,
         in_specs=[in_spec, in_spec, in_spec, in_spec],
@@ -121,7 +129,7 @@ def build_chunk_scores_pallas(q, k, b, g, scale, config: KernelConfig = DEFAULT_
 
 
 # ---------- Kernel B ----------
-def _micro_forward_substitution(T_mb, mb: int, eps: float):
+def _micro_forward_substitution(T_mb, mb: int, eps: float, config: KernelConfig):
     idx = jnp.arange(mb)
     T_mb = T_mb * (1.0 - eps)
 
@@ -130,7 +138,7 @@ def _micro_forward_substitution(T_mb, mb: int, eps: float):
         t_row = jnp.sum(T_mb * onehot_i[:, None], axis=0)
         contrib = jnp.sum(t_row[:, None] * A, axis=0)
         new_row = onehot_i - contrib
-        new_row = sanitize(new_row)
+        new_row = sanitize(new_row, config)
         mask_col = onehot_i[:, None]
         A = A * (1.0 - mask_col) + mask_col * new_row[None, :]
         return A
@@ -147,7 +155,7 @@ def _block_solve(T_full, config: KernelConfig):
 
     for m in range(N_MICRO):
         T_mm = T_full[m * MB:(m + 1) * MB, m * MB:(m + 1) * MB]
-        A_mm = sanitize(_micro_forward_substitution(T_mm, MB, eps))
+        A_mm = sanitize(_micro_forward_substitution(T_mm, MB, eps, config), config)
         blocks[m][m] = A_mm
 
         for n in range(m - 1, -1, -1):
@@ -156,9 +164,9 @@ def _block_solve(T_full, config: KernelConfig):
                 T_mk = T_full[m * MB:(m + 1) * MB, k * MB:(k + 1) * MB]
                 A_kn = blocks[k][n]
                 contrib = jnp.dot(T_mk * (1.0 - eps), A_kn, precision=_HIGHEST)
-                acc = sanitize(acc + contrib)
+                acc = sanitize(acc + contrib, config)
             A_mn = -jnp.dot(A_mm, acc, precision=_HIGHEST)
-            A_mn = sanitize(A_mn)
+            A_mn = sanitize(A_mn, config)
             blocks[m][n] = A_mn
 
     rows = []
@@ -193,7 +201,7 @@ def _kernel_b_body(akk_ref, a_ref, *, bt: int, bc: int, config: KernelConfig):
     # NOTE: the (1-eps) damping here is the ONLY place damping is applied
     # to Akk in the whole forward path. It is baked into _block_solve /
     # _micro_forward_substitution as well as this top-level T10 cross
-    # term, so this single call is what "A = (I + (1-wy_eps)*Akk)^-1"
+    # term, so this single call is what "A = (I + (1-eps)*Akk)^-1"
     # (as documented in gdn2_bwd.py's B3 comment) actually refers to.
     # Callers (build_chunk_scores_pallas -> wy_solve_pallas) must pass
     # the RAW, undamped Akk -- do not pre-damp Akk before calling
@@ -201,9 +209,9 @@ def _kernel_b_body(akk_ref, a_ref, *, bt: int, bc: int, config: KernelConfig):
     # silently diverges from what B3's backward assumes.
     eps = config.wy_eps
     tmp = jnp.dot(T10 * (1.0 - eps), A00, precision=_HIGHEST)
-    tmp = sanitize(tmp)
+    tmp = sanitize(tmp, config)
     A10 = -jnp.dot(A11, tmp, precision=_HIGHEST)
-    A10 = sanitize(A10)
+    A10 = sanitize(A10, config)
 
     a_ref[0, 0, 0] = jnp.zeros((bt, bt), dtype=jnp.float32)
     a_ref[0, 0, 0, 0:bc, 0:bc] = A00
@@ -243,7 +251,7 @@ def wy_solve_pallas(Akk, config: KernelConfig = DEFAULT_CONFIG):
 
 # ---------- Kernel C ----------
 def _kernel_c_body(q_ref, k_ref, v_ref, w_ref, b_ref, g_ref, a_ref,
-                   w_pseudo_ref, u_ref, kg_ref, qg_ref, gc_last_ref, *, bt: int):
+                   w_pseudo_ref, u_ref, kg_ref, qg_ref, gc_last_ref, *, bt: int, config: KernelConfig):
     q = q_ref[0, 0, 0].astype(jnp.float32)
     k = k_ref[0, 0, 0].astype(jnp.float32)
     v = v_ref[0, 0, 0].astype(jnp.float32)
@@ -259,15 +267,15 @@ def _kernel_c_body(q_ref, k_ref, v_ref, w_ref, b_ref, g_ref, a_ref,
     kb_decayed = b * k * jnp.exp(gc)
     w_pseudo = jnp.dot(A, kb_decayed, precision=_HIGHEST)
     u = jnp.dot(A, w * v, precision=_HIGHEST)
-    w_pseudo = sanitize(w_pseudo)
-    u = sanitize(u)
+    w_pseudo = sanitize(w_pseudo, config)
+    u = sanitize(u, config)
 
     gc_last_row = gc[bt - 1]
     kg = k * jnp.exp(gc_last_row[None, :] - gc)
     qg = q * jnp.exp(gc)
-    kg = sanitize(kg)
-    qg = sanitize(qg)
-    gc_last_row = sanitize(gc_last_row)
+    kg = sanitize(kg, config)
+    qg = sanitize(qg, config)
+    gc_last_row = sanitize(gc_last_row, config)
 
     w_pseudo_ref[0, 0, 0] = w_pseudo
     u_ref[0, 0, 0] = u
@@ -291,7 +299,7 @@ def recompute_wy_pallas(q, k, v, w, b, g, A, config: KernelConfig = DEFAULT_CONF
     gclast_spec = pl.BlockSpec((1, 1, 1, 1, D), lambda i, h, c: (i, h, c, 0, 0))
 
     w_pseudo, u, kg, qg, gc_last = pl.pallas_call(
-        lambda *refs: _kernel_c_body(*refs, bt=config.bt),
+        lambda *refs: _kernel_c_body(*refs, bt=config.bt, config=config),
         grid=grid,
         in_specs=[io_spec, io_spec, io_spec, io_spec, io_spec, io_spec, a_spec],
         out_specs=[io_spec, io_spec, io_spec, io_spec, gclast_spec],
@@ -315,7 +323,7 @@ def gdn2_inter_chunk_combine(Aqk, w_pseudo, u, kg, qg, gc_last, scale, h0=None,
     bsz, H, n_chunks, _BT, D = w_pseudo.shape
     if h0 is None:
         h0 = jnp.zeros((bsz, H, D, D), dtype=jnp.float32)
-    h0 = sanitize_h0(h0)
+    h0 = sanitize_h0(h0, config)
 
     to_scan = tuple(jnp.moveaxis(x, 2, 0) for x in (Aqk, w_pseudo, u, kg, qg, gc_last))
 
@@ -330,8 +338,8 @@ def gdn2_inter_chunk_combine(Aqk, w_pseudo, u, kg, qg, gc_last, scale, h0=None,
         decay_h = jnp.exp(gclast_c)[..., None]
         write = jnp.einsum("bhid,bhiv->bhdv", kg_c, v_new, precision=_HIGHEST)
         h_new = h_pre * decay_h + write
-        h_new = sanitize(h_new)
-        o_c = sanitize(o_c)
+        h_new = sanitize(h_new, config)
+        o_c = sanitize(o_c, config)
         return h_new, o_c
 
     h_final, o_scanned = jax.lax.scan(step, h0, to_scan)
@@ -347,7 +355,7 @@ def gdn2_inter_chunk_combine_with_state(Aqk, w_pseudo, u, kg, qg, gc_last, scale
     bsz, H, n_chunks, _BT, D = w_pseudo.shape
     if h0 is None:
         h0 = jnp.zeros((bsz, H, D, D), dtype=jnp.float32)
-    h0 = sanitize_h0(h0)
+    h0 = sanitize_h0(h0, config)
 
     to_scan = tuple(jnp.moveaxis(x, 2, 0) for x in (Aqk, w_pseudo, u, kg, qg, gc_last))
 
@@ -362,8 +370,8 @@ def gdn2_inter_chunk_combine_with_state(Aqk, w_pseudo, u, kg, qg, gc_last, scale
         decay_h = jnp.exp(gclast_c)[..., None]
         write = jnp.einsum("bhid,bhiv->bhdv", kg_c, v_new, precision=_HIGHEST)
         h_new = h_pre * decay_h + write
-        h_new = sanitize(h_new)
-        o_c = sanitize(o_c)
+        h_new = sanitize(h_new, config)
+        o_c = sanitize(o_c, config)
         return h_new, (o_c, h_pre, v_new)
 
     h_final, (o_scanned, h_pre_all, v_new_all) = jax.lax.scan(step, h0, to_scan)
@@ -408,14 +416,9 @@ def gdn2_pallas_forward_with_residuals(q, k, v, w, b, g, scale, h0=None,
 
     # FIX (double-damping bug): wy_solve_pallas already applies
     # (1 - config.wy_eps) damping internally (see _kernel_b_body /
-    # _block_solve). Pre-damping Akk here as well used to make this
-    # trainable path solve (I + (1-wy_eps)^2 * Akk)^-1 instead of the
-    # documented (I + (1-wy_eps) * Akk)^-1 -- silently diverging from
-    # gdn2_pallas_forward (the inference-only path, which passes Akk
-    # through undamped) on the exact same inputs. Pass the RAW Akk here
-    # too, so both forward entry points solve the identical system and
-    # gdn2_pallas_forward_trainable's primal output matches
-    # gdn2_pallas_forward bit-for-bit (see
+    # _block_solve). Pass the RAW Akk here too, so both forward entry
+    # points solve the identical system and gdn2_pallas_forward_trainable's
+    # primal output matches gdn2_pallas_forward bit-for-bit (see
     # test_forward_and_trainable_forward_agree_exactly).
     A = wy_solve_pallas(Akk, config)
     A = _stage_diag(f"{debug_tag}:kernel_B_wy_inverse_A", A)
