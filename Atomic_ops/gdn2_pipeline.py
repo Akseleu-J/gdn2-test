@@ -95,8 +95,8 @@ def _gdn2_core_bwd(scale, config, residuals, cotangents):
 
     # B1
     dh_all, dh0, dv_all = gdn2_dhu_backward(
-        do_r, dv_partial, w_pseudo, qg, kg, gc_last, scale, dht=dh_final
-    )
+        do_r, dv_partial, w_pseudo, qg, kg, gc_last, scale, dht=dh_final, config=config
+     )
     dh_next_all = _build_dh_next_all(dh_all, dh_final)
 
     # B3
@@ -132,7 +132,7 @@ def _gdn2_core_bwd(scale, config, residuals, cotangents):
     )
     # B5
     dgc_total = b3_out["dgc"] + dgc4
-    dg_raw = reverse_cumsum_bwd(dgc_total, chunk_size=config.bt)
+    dg_raw = reverse_cumsum_bwd(dgc_total, chunk_size=config.bt, config=config)
 
     # Assemble
     dq = _r2f(b3_out["dq"] + dq4, bsz, n_chunks, config.bt, H, D)
