@@ -112,9 +112,23 @@ def _gdn2_core_bwd(scale, config, residuals, cotangents):
     )
 
     # B4
-    dAkk_undamped = b3_out["dAkk"] * (1.0 - config.wy_eps)   # NEW: chain rule through Akk*(1-wy_eps)
+    # FIX (double-damping bug): b3_out["dAkk"] is already d L / d Akk_raw
+    # -- _kernel_b3_body (gdn2_bwd.py) applies the ONE (1 - wy_eps) chain
+    # rule factor internally, matching the SINGLE damping that
+    # wy_solve_pallas now applies to the raw Akk in the forward pass (see
+    # gdn2_fwd.py's gdn2_pallas_forward_with_residuals). There used to be
+    # a second, external damping applied here as well
+    # ("dAkk_undamped = b3_out['dAkk'] * (1.0 - config.wy_eps)"), which
+    # was the backward-side half of a forward/backward-consistent but
+    # doubly-damped computation: the forward pre-damped Akk before
+    # wy_solve_pallas (which damps again internally), giving an effective
+    # (1-wy_eps)^2 solve, and this line compensated for that in reverse.
+    # Now that the forward passes the raw Akk through exactly once (see
+    # gdn2_fwd.py), this second multiply must NOT be applied here, or the
+    # chain rule would be off by an extra (1-wy_eps) factor relative to
+    # what the (now-corrected) forward actually computed.
     dq4, dk4, db4, dgc4 = intra_backward_pallas(
-        dAqk, dAkk_undamped, q, k, b, g, scale, config
+        dAqk, b3_out["dAkk"], q, k, b, g, scale, config
     )
     # B5
     dgc_total = b3_out["dgc"] + dgc4
