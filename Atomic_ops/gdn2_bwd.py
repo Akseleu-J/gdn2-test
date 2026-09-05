@@ -1,5 +1,10 @@
 """
 Backward kernels: B1 (state) -> B2 (dAqk/dv) -> B3 (WY/dqkg) -> B4 (intra) -> B5 (reverse cumsum).
+
+PATCH (clip-plumbing fix): every sanitize()/clip_acc() call site now
+explicitly passes `config`, so KernelConfig.clip is actually honored
+instead of silently defaulting to DEFAULT_CONFIG.clip. See
+test_clip_config_plumbing.py.
 """
 from __future__ import annotations
 
@@ -17,20 +22,21 @@ _HIGHEST = jax.lax.Precision.HIGHEST
 
 
 # ---------- B5 ----------
-def reverse_cumsum_bwd(dgc, chunk_size: int):
+def reverse_cumsum_bwd(dgc, chunk_size: int, config: KernelConfig = DEFAULT_CONFIG):
     C = chunk_size
     idx = jnp.arange(C)
     triu_ones = (idx[:, None] <= idx[None, :]).astype(jnp.float32)
     dg_raw = jnp.einsum("ij,...jd->...id", triu_ones, dgc.astype(jnp.float32), precision=_HIGHEST)
-    return sanitize(dg_raw)
+    return sanitize(dg_raw, config)
 
 
 # ---------- B1 ----------
-def gdn2_dhu_backward(do, dv_partial, w_pseudo, qg, kg, gc_last, scale, dht=None):
+def gdn2_dhu_backward(do, dv_partial, w_pseudo, qg, kg, gc_last, scale, dht=None,
+                       config: KernelConfig = DEFAULT_CONFIG):
     bsz, H, n_chunks, BT, D = qg.shape
     if dht is None:
         dht = jnp.zeros((bsz, H, D, D), dtype=jnp.float32)
-    dht = sanitize(dht)
+    dht = sanitize(dht, config)
 
     to_scan = tuple(jnp.moveaxis(x, 2, 0) for x in (do, dv_partial, w_pseudo, qg, kg, gc_last))
 
@@ -44,12 +50,12 @@ def gdn2_dhu_backward(do, dv_partial, w_pseudo, qg, kg, gc_last, scale, dht=None
 
         dv_write = jnp.einsum("bhid,bhdv->bhiv", kg_c, dh_carry, precision=_HIGHEST)
         dv_new_c = dvp_c + dv_write
-        dv_new_c = sanitize(dv_new_c)
+        dv_new_c = sanitize(dv_new_c, config)
 
         contrib_from_vnew = -jnp.einsum("bhjd,bhjv->bhdv", wp_c, dv_new_c, precision=_HIGHEST)
 
         dh_pre_c = contrib_from_output + contrib_from_state + contrib_from_vnew
-        dh_pre_c = sanitize(dh_pre_c)
+        dh_pre_c = sanitize(dh_pre_c, config)
         return dh_pre_c, (dh_pre_c, dv_new_c)
 
     dh0, (dh_all_rev, dv_all_rev) = jax.lax.scan(step, dht, to_scan, reverse=True)
@@ -59,7 +65,7 @@ def gdn2_dhu_backward(do, dv_partial, w_pseudo, qg, kg, gc_last, scale, dht=None
 
 
 # ---------- B2 ----------
-def _kernel_b2_body(aqk_ref, vnew_ref, do_ref, daqk_ref, dvnew_ref, *, bt: int):
+def _kernel_b2_body(aqk_ref, vnew_ref, do_ref, daqk_ref, dvnew_ref, *, bt: int, config: KernelConfig):
     Aqk = aqk_ref[0, 0, 0].astype(jnp.float32)
     v_new = vnew_ref[0, 0, 0].astype(jnp.float32)
     do = do_ref[0, 0, 0].astype(jnp.float32)
@@ -70,8 +76,8 @@ def _kernel_b2_body(aqk_ref, vnew_ref, do_ref, daqk_ref, dvnew_ref, *, bt: int):
     dAqk = jnp.dot(do, v_new.T, precision=_HIGHEST) * causal
     dv_new = jnp.dot(Aqk.T, do, precision=_HIGHEST)
 
-    daqk_ref[0, 0, 0] = sanitize(dAqk)
-    dvnew_ref[0, 0, 0] = sanitize(dv_new)
+    daqk_ref[0, 0, 0] = sanitize(dAqk, config)
+    dvnew_ref[0, 0, 0] = sanitize(dv_new, config)
 
 
 def dav_backward_pallas(Aqk, v_new, do, config: KernelConfig = DEFAULT_CONFIG):
@@ -81,7 +87,7 @@ def dav_backward_pallas(Aqk, v_new, do, config: KernelConfig = DEFAULT_CONFIG):
     io_spec = pl.BlockSpec((1, 1, 1, config.bt, D), lambda i, h, c: (i, h, c, 0, 0))
 
     dAqk, dv_new = pl.pallas_call(
-        lambda *refs: _kernel_b2_body(*refs, bt=config.bt),
+        lambda *refs: _kernel_b2_body(*refs, bt=config.bt, config=config),
         grid=grid,
         in_specs=[aqk_spec, io_spec, io_spec],
         out_specs=[aqk_spec, io_spec],
@@ -98,7 +104,7 @@ def dav_backward_pallas(Aqk, v_new, do, config: KernelConfig = DEFAULT_CONFIG):
 def _kernel_b3_body(q_ref, k_ref, b_ref, w_ref, v_ref, gc_ref, a_ref, akk_ref,
                      hpre_ref, vnew_ref, do_ref, dv_ref, dhnext_ref,
                      dq_ref, dk_ref, db_ref, dw_ref, dvraw_ref, dgc_ref, dakk_ref,
-                     *, scale: float, bt: int, wy_eps: float):
+                     *, scale: float, bt: int, wy_eps: float, config: KernelConfig):
     q_c = q_ref[0, 0, 0].astype(jnp.float32)
     k_c = k_ref[0, 0, 0].astype(jnp.float32)
     b_c = b_ref[0, 0, 0].astype(jnp.float32)
@@ -136,13 +142,13 @@ def _kernel_b3_body(q_ref, k_ref, b_ref, w_ref, v_ref, gc_ref, a_ref, akk_ref,
     dwv = jnp.dot(A.T, du, precision=_HIGHEST)
 
     dA_total = dA_from_w + dA_from_u
-    dA_total = sanitize(dA_total)
+    dA_total = sanitize(dA_total, config)
 
     idx = jnp.arange(C)
     strict = (idx[:, None] > idx[None, :]).astype(jnp.float32)
 
     tmp = jnp.dot(dA_total, A.T, precision=_HIGHEST)
-    tmp = sanitize(tmp)
+    tmp = sanitize(tmp, config)
     dAkk_raw = -jnp.dot(A.T, tmp, precision=_HIGHEST)
     # Chain rule through the SINGLE (1-wy_eps) damping applied inside
     # wy_solve_pallas (gdn2_fwd.py's _block_solve / _kernel_b_body). The
@@ -181,13 +187,13 @@ def _kernel_b3_body(q_ref, k_ref, b_ref, w_ref, v_ref, gc_ref, a_ref, akk_ref,
     row_mask = (idx == (C - 1)).astype(jnp.float32)[:, None]
     dgc = dgc + row_mask * dgc_last_total[None, :]
 
-    dq_ref[0, 0, 0] = sanitize(dq)
-    dk_ref[0, 0, 0] = sanitize(dk)
-    db_ref[0, 0, 0] = sanitize(db)
-    dw_ref[0, 0, 0] = sanitize(dw)
-    dvraw_ref[0, 0, 0] = sanitize(dv_raw)
-    dakk_ref[0, 0, 0] = sanitize(dAkk)
-    dgc_ref[0, 0, 0] = sanitize(dgc)
+    dq_ref[0, 0, 0] = sanitize(dq, config)
+    dk_ref[0, 0, 0] = sanitize(dk, config)
+    db_ref[0, 0, 0] = sanitize(db, config)
+    dw_ref[0, 0, 0] = sanitize(dw, config)
+    dvraw_ref[0, 0, 0] = sanitize(dv_raw, config)
+    dakk_ref[0, 0, 0] = sanitize(dAkk, config)
+    dgc_ref[0, 0, 0] = sanitize(dgc, config)
 
 
 def wy_dqkg_backward_pallas(q, k, b, w, v, gc, A, Akk, h_pre_all, v_new_all,
@@ -200,7 +206,7 @@ def wy_dqkg_backward_pallas(q, k, b, w, v, gc, A, Akk, h_pre_all, v_new_all,
     h_spec = pl.BlockSpec((1, 1, 1, D, D), lambda i, h, c: (i, h, c, 0, 0))
 
     dq, dk, db, dw, dv_raw, dgc, dAkk = pl.pallas_call(
-        lambda *refs: _kernel_b3_body(*refs, scale=scale, bt=config.bt, wy_eps=config.wy_eps),
+        lambda *refs: _kernel_b3_body(*refs, scale=scale, bt=config.bt, wy_eps=config.wy_eps, config=config),
         grid=grid,
         in_specs=[io_spec, io_spec, io_spec, io_spec, io_spec, io_spec,
                    score_spec, score_spec, h_spec, io_spec, io_spec, io_spec, h_spec],
@@ -242,7 +248,7 @@ def _dgc_pair_sum(dM, edecay, L, R, clipmask):
 
 def _kernel_b4_body(q_ref, k_ref, b_ref, g_ref, daqk_ref, dakk_ref,
                      dq_ref, dk_ref, db_ref, dgc_ref, *, scale: float, bt: int, bc: int, n_sub: int,
-                     use_centering: bool):
+                     use_centering: bool, config: KernelConfig):
     q_full = q_ref[0, 0, 0].astype(jnp.float32)
     k_full = k_ref[0, 0, 0].astype(jnp.float32)
     b_full = b_ref[0, 0, 0].astype(jnp.float32)
@@ -323,11 +329,11 @@ def _kernel_b4_body(q_ref, k_ref, b_ref, g_ref, daqk_ref, dakk_ref,
                 dq_i_from_scaled = dq_scaled * eq_i
                 dbk_i_from_scaled = dbk_scaled * eq_i   # d(b_i*k_i)
 
-                dq_ref[0, 0, 0, i0:i1] = clip_acc(dq_ref[0, 0, 0, i0:i1] + dq_i_from_scaled)
-                db_ref[0, 0, 0, i0:i1] = clip_acc(db_ref[0, 0, 0, i0:i1] + dbk_i_from_scaled)
-                dk_ref[0, 0, 0, j0:j1] = clip_acc(dk_ref[0, 0, 0, j0:j1] + dk_j_from_scaled)
-                dgc_ref[0, 0, 0, i0:i1] = clip_acc(dgc_ref[0, 0, 0, i0:i1] + dgq_i)
-                dgc_ref[0, 0, 0, j0:j1] = clip_acc(dgc_ref[0, 0, 0, j0:j1] - dgk_j)
+                dq_ref[0, 0, 0, i0:i1] = clip_acc(dq_ref[0, 0, 0, i0:i1] + dq_i_from_scaled, config)
+                db_ref[0, 0, 0, i0:i1] = clip_acc(db_ref[0, 0, 0, i0:i1] + dbk_i_from_scaled, config)
+                dk_ref[0, 0, 0, j0:j1] = clip_acc(dk_ref[0, 0, 0, j0:j1] + dk_j_from_scaled, config)
+                dgc_ref[0, 0, 0, i0:i1] = clip_acc(dgc_ref[0, 0, 0, i0:i1] + dgq_i, config)
+                dgc_ref[0, 0, 0, j0:j1] = clip_acc(dgc_ref[0, 0, 0, j0:j1] - dgk_j, config)
                 # d(gq_i)/d(gn) = -1, d(gk_j)/d(gn) = +1 (within the clip
                 # window; clipmask_q/clipmask_k already zero the
                 # out-of-window terms consistently with dgq_i/dgk_j).
@@ -349,11 +355,11 @@ def _kernel_b4_body(q_ref, k_ref, b_ref, g_ref, daqk_ref, dakk_ref,
                 dR_kk = _dR_pair_sum(dM_kk, edecay, L_kk)
                 dgc_i_kk, dgc_j_kk = _dgc_pair_sum(dM_kk, edecay, L_kk, R_kk, clipmask)
 
-                dq_ref[0, 0, 0, i0:i1] = clip_acc(dq_ref[0, 0, 0, i0:i1] + dL_qk * scale)
-                db_ref[0, 0, 0, i0:i1] = clip_acc(db_ref[0, 0, 0, i0:i1] + dL_kk)
-                dk_ref[0, 0, 0, j0:j1] = clip_acc(dk_ref[0, 0, 0, j0:j1] + dR_qk + dR_kk)
-                dgc_ref[0, 0, 0, i0:i1] = clip_acc(dgc_ref[0, 0, 0, i0:i1] + dgc_i_qk + dgc_i_kk)
-                dgc_ref[0, 0, 0, j0:j1] = clip_acc(dgc_ref[0, 0, 0, j0:j1] + dgc_j_qk + dgc_j_kk)
+                dq_ref[0, 0, 0, i0:i1] = clip_acc(dq_ref[0, 0, 0, i0:i1] + dL_qk * scale, config)
+                db_ref[0, 0, 0, i0:i1] = clip_acc(db_ref[0, 0, 0, i0:i1] + dL_kk, config)
+                dk_ref[0, 0, 0, j0:j1] = clip_acc(dk_ref[0, 0, 0, j0:j1] + dR_qk + dR_kk, config)
+                dgc_ref[0, 0, 0, i0:i1] = clip_acc(dgc_ref[0, 0, 0, i0:i1] + dgc_i_qk + dgc_i_kk, config)
+                dgc_ref[0, 0, 0, j0:j1] = clip_acc(dgc_ref[0, 0, 0, j0:j1] + dgc_j_qk + dgc_j_kk, config)
 
     # FIX (use_centering backward completion): scatter the accumulated
     # d(Loss)/d(gn) contribution onto row n_mid of dgc_ref. Before this
@@ -363,7 +369,7 @@ def _kernel_b4_body(q_ref, k_ref, b_ref, g_ref, daqk_ref, dakk_ref,
     # analogue of B3's `row_mask` scatter of dgc_last_total onto the
     # last row of dgc.
     if use_centering:
-        dgc_ref[0, 0, 0, n_mid] = clip_acc(dgc_ref[0, 0, 0, n_mid] + dgn_acc)
+        dgc_ref[0, 0, 0, n_mid] = clip_acc(dgc_ref[0, 0, 0, n_mid] + dgn_acc, config)
 
     dbk_final = db_ref[0, 0, 0]
     dk_final = dk_ref[0, 0, 0] + dbk_final * b_full
@@ -371,10 +377,10 @@ def _kernel_b4_body(q_ref, k_ref, b_ref, g_ref, daqk_ref, dakk_ref,
     dq_final = dq_ref[0, 0, 0]
     dgc_final = dgc_ref[0, 0, 0]
 
-    dq_ref[0, 0, 0] = sanitize(dq_final)
-    dk_ref[0, 0, 0] = sanitize(dk_final)
-    db_ref[0, 0, 0] = sanitize(db_final)
-    dgc_ref[0, 0, 0] = sanitize(dgc_final)
+    dq_ref[0, 0, 0] = sanitize(dq_final, config)
+    dk_ref[0, 0, 0] = sanitize(dk_final, config)
+    db_ref[0, 0, 0] = sanitize(db_final, config)
+    dgc_ref[0, 0, 0] = sanitize(dgc_final, config)
 
 def intra_backward_pallas(dAqk, dAkk, q, k, b, g, scale, config: KernelConfig = DEFAULT_CONFIG, interpret: bool = False):
     bsz, L, H, D = q.shape
@@ -392,7 +398,7 @@ def intra_backward_pallas(dAqk, dAkk, q, k, b, g, scale, config: KernelConfig = 
     dq, dk, db, dgc = pl.pallas_call(
         lambda *refs: _kernel_b4_body(
             *refs, scale=scale, bt=config.bt, bc=config.bc, n_sub=config.n_sub,
-            use_centering=config.use_centering,
+            use_centering=config.use_centering, config=config,
         ),
         grid=grid,
         in_specs=[io_spec, io_spec, io_spec, io_spec, score_spec, score_spec],
