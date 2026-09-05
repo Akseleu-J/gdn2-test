@@ -4,7 +4,6 @@ shared across the forward/backward Pallas kernels.
 """
 from __future__ import annotations
 
-import contextvars
 import dataclasses as dc
 import os
 
@@ -20,8 +19,8 @@ class KernelConfig:
     bc: int = 128
     mb: int = 16
     clip: float = 1e4
-    wy_eps: float = 0.0          # NEW: Tikhonov damping strength, 0 = off (current behavior)
-    use_centering: bool = False  # NEW: midpoint-centered decay factorization in Kernel A/B4
+    wy_eps: float = 0.0          # Tikhonov damping strength, 0 = off (current behavior)
+    use_centering: bool = False  # midpoint-centered decay factorization in Kernel A/B4
 
     @property
     def n_sub(self) -> int:
@@ -62,6 +61,36 @@ class KernelConfig:
             raise ValueError(f"bc={self.bc} must be divisible by mb={self.mb}")
         if not (0.0 <= self.wy_eps < 1.0):
             raise ValueError(f"wy_eps={self.wy_eps} must be in [0, 1)")
+        # GUARD: use_centering=True is forward-only safe. The backward
+        # kernel (_kernel_b4_body, atomic_ops/gdn2_bwd.py) accumulates
+        # `dgn_acc` -- the gradient contribution flowing through the
+        # shared per-chunk reference point `gn = gc[bt//2]` used by the
+        # centered decay factorization -- but NEVER writes it into
+        # `dgc_ref`. That contribution is silently dropped, so dgc (and
+        # therefore dg after B5's reverse-cumsum) is systematically wrong
+        # whenever use_centering=True, regardless of the separate
+        # double-counting bug that existed in the stray post-loop line.
+        # Until dgn_acc is properly scattered onto position bt//2 of
+        # dgc_ref (mirroring how B3 scatters dgc_last_total onto the last
+        # row via `row_mask`) and covered by a backward-equivalent of
+        # test_kernel_a_use_centering_matches_default, this path must not
+        # be reachable for training. Forward-only usage (no gradients)
+        # would still be mathematically fine, but there is currently no
+        # way to request "forward-only" at the config level, so we block
+        # construction entirely rather than let a trainable call silently
+        # produce wrong dg.
+        if self.use_centering:
+            raise NotImplementedError(
+                "use_centering=True is not safe for training: the B4 "
+                "backward kernel (_kernel_b4_body) does not propagate the "
+                "gradient contribution through the shared reference point "
+                "`gn` into dgc (see KNOWN_LIMITATIONS.md). Forward-only "
+                "consumers must call the underlying forward kernels "
+                "directly with an unfrozen dataclasses.replace(...) config "
+                "and take responsibility for not differentiating through "
+                "it; the public KernelConfig refuses to construct this "
+                "config to prevent accidental use in gdn2_pallas_forward_trainable."
+            )
 
 
 KAGGLE_SMALL = KernelConfig(bt=128, bc=64, mb=16, clip=1e4, wy_eps=1e-3)
@@ -70,74 +99,17 @@ KAGGLE_LARGE = KernelConfig(bt=256, bc=128, mb=16, clip=5e3, wy_eps=1e-3)
 DEFAULT_CONFIG = KAGGLE_MEDIUM
 
 
-# FIX: sanitize()/clip_acc() were called from *inside* Pallas kernel
-# bodies (_kernel_a_body, _kernel_b_body, _kernel_b3_body, _kernel_b4_body,
-# gdn2_bwd.py step functions, etc.) WITHOUT passing `config`, so they
-# silently always clipped to DEFAULT_CONFIG.clip=1e4 regardless of which
-# KernelConfig the user actually selected (e.g. KAGGLE_LARGE's clip=5e3
-# was never honored inside any kernel body -- only in the few call sites
-# outside pallas_call that happened to pass config explicitly).
-#
-# Rather than touch every one of the ~40 call sites inside kernel bodies
-# (error-prone, easy to miss one), the active clip is threaded through a
-# contextvar set once, at the entry-point function (build_chunk_scores_
-# pallas, wy_solve_pallas, recompute_wy_pallas, gdn2_inter_chunk_combine*,
-# and the corresponding gdn2_bwd.py entry points), via `clip_scope`. This
-# is safe because Pallas kernel bodies are invoked synchronously by
-# Python during tracing/lowering inside the same `pl.pallas_call` call --
-# there is no thread hop, so the contextvar set just before pallas_call
-# is still active when the kernel body (and any nested reference/helper
-# it calls, e.g. _micro_forward_substitution) executes.
-_current_clip: contextvars.ContextVar = contextvars.ContextVar(
-    "_gdn2_current_clip", default=None
-)
-
-
-class clip_scope:
-    """Context manager: sets the clip bound used by sanitize()/clip_acc()
-    calls that don't receive an explicit `config` (i.e. calls made from
-    inside Pallas kernel bodies). Wrap every pallas_call entry point:
-
-        with clip_scope(config):
-            ... = pl.pallas_call(...)(...)
-    """
-    __slots__ = ("_config", "_token")
-
-    def __init__(self, config: "KernelConfig"):
-        self._config = config
-
-    def __enter__(self):
-        self._token = _current_clip.set(self._config.clip)
-        return self
-
-    def __exit__(self, *exc):
-        _current_clip.reset(self._token)
-        return False
-
-
-def sanitize(x, config: KernelConfig = None):
-    """Standard clip + nan_to_num defense used at every kernel boundary.
-
-    If `config` is omitted (the common case for calls made from inside a
-    Pallas kernel body), the clip bound comes from the nearest enclosing
-    `clip_scope(config)` set by the entry-point function, falling back to
-    DEFAULT_CONFIG.clip only if no scope is active (e.g. calling this
-    helper directly outside any kernel entry point).
-    """
-    if config is not None:
-        c = config.clip
-    else:
-        c = _current_clip.get()
-        if c is None:
-            c = DEFAULT_CONFIG.clip
+def sanitize(x, config: KernelConfig = DEFAULT_CONFIG):
+    """Standard clip + nan_to_num defense used at every kernel boundary."""
+    c = config.clip
     return jnp.nan_to_num(jnp.clip(x, -c, c), nan=0.0, posinf=c, neginf=-c)
 
 
-def sanitize_h0(h0, config: KernelConfig = None):
+def sanitize_h0(h0, config: KernelConfig = DEFAULT_CONFIG):
     return sanitize(h0, config)
 
 
-def clip_acc(x, config: KernelConfig = None):
+def clip_acc(x, config: KernelConfig = DEFAULT_CONFIG):
     """Same as sanitize; separate name kept for call-site clarity in
     read-modify-write accumulation loops (see gdn2_bwd.py, Kernel B4)."""
     return sanitize(x, config)
