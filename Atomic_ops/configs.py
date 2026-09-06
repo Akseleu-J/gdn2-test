@@ -19,8 +19,29 @@ class KernelConfig:
     bc: int = 128
     mb: int = 16
     clip: float = 1e4
-    wy_eps: float = 0.0          # Tikhonov damping strength, 0 = off (current behavior)
-    use_centering: bool = False  # midpoint-centered decay factorization in Kernel A/B4
+    wy_eps: float = 0.0
+    use_centering: bool = False
+    # Explicit, opt-in acknowledgement required to construct a
+    # use_centering=True config. Defaults to False so the safety gate below
+    # still fires for anyone who did not deliberately set this. This exists
+    # to unblock CONTROLLED experiments (isolated kernel tests, benchmarks,
+    # the deep-correctness suite run with use_centering=True) while keeping
+    # the public default path (gdn2_pallas_forward_trainable with a
+    # KAGGLE_* preset) impossible to hit accidentally.
+    #
+    # As of the v0.1.5 kernel-gap investigation (see KNOWN_LIMITATIONS.md
+    # §1/§6 and the follow-up dgn-gradient validation), the B4 backward
+    # kernel's `dgn_acc` path has been independently cross-checked against
+    # jax.vjp of an isolated reference implementation (5 seeds, bt=256
+    # production shape, dq/dk/db/dgc including the n_mid row specifically)
+    # with rel_err ~1e-6, and the Kernel A / B4 MXU-factorization gives a
+    # measured 9.2x / 12.7x TPU speedup respectively. This is promising but
+    # is NOT yet equivalent to the full deep-correctness suite (multi-seed
+    # sweep vs token-serial reference, wy_eps>0 damping interaction,
+    # finite-difference through the full custom_vjp pipeline, KAGGLE_SMALL
+    # blocking) -- hence this stays an explicit opt-in rather than a
+    # default-on preset change until that suite has been run and reported.
+    unsafe_allow_centering: bool = False
 
     @property
     def n_sub(self) -> int:
@@ -33,22 +54,6 @@ class KernelConfig:
     def __post_init__(self):
         if self.bt % self.bc != 0:
             raise ValueError(f"bt={self.bt} must be divisible by bc={self.bc}")
-        # FIX (найдено в grid_bt_bc_condition_diag.py, Часть 3 -- bc<bt/2
-        # давал max|diff vs exact|=1.0 РОВНО, т.е. НЕ численную
-        # неточность, а структурно нулевые блоки): wy_solve_pallas'
-        # top-level solve (Kernel B, _kernel_b_body) реализует ТОЛЬКО
-        # двухблочный split (T00/T11/T10) и жёстко предполагает
-        # bt == 2*bc. При bc < bt/2 три четверти матрицы решения A
-        # никогда не записываются и остаются нулями из инициализации --
-        # это не деградация точности, а отсутствие вычисления вообще.
-        # `bc` НЕ является ручкой точности/устойчивости решателя --
-        # экспериментально подтверждено (grid_bt_bc_condition_diag.py,
-        # Часть 3, повторный корректный прогон), что `mb` (granularity
-        # внутри block-recursive forward substitution) не влияет на
-        # точность решения вообще -- только на скорость. Проверяем
-        # инвариант здесь, чтобы невалидный KernelConfig нельзя было
-        # создать вообще, включая экспериментальные/диагностические
-        # скрипты.
         if self.bt != 2 * self.bc:
             raise ValueError(
                 f"bt={self.bt} must equal 2*bc (top-level WY-solve split "
@@ -61,35 +66,36 @@ class KernelConfig:
             raise ValueError(f"bc={self.bc} must be divisible by mb={self.mb}")
         if not (0.0 <= self.wy_eps < 1.0):
             raise ValueError(f"wy_eps={self.wy_eps} must be in [0, 1)")
-        # GUARD: use_centering=True is forward-only safe. The backward
-        # kernel (_kernel_b4_body, atomic_ops/gdn2_bwd.py) accumulates
-        # `dgn_acc` -- the gradient contribution flowing through the
-        # shared per-chunk reference point `gn = gc[bt//2]` used by the
-        # centered decay factorization -- but NEVER writes it into
-        # `dgc_ref`. That contribution is silently dropped, so dgc (and
-        # therefore dg after B5's reverse-cumsum) is systematically wrong
-        # whenever use_centering=True, regardless of the separate
-        # double-counting bug that existed in the stray post-loop line.
-        # Until dgn_acc is properly scattered onto position bt//2 of
-        # dgc_ref (mirroring how B3 scatters dgc_last_total onto the last
-        # row via `row_mask`) and covered by a backward-equivalent of
-        # test_kernel_a_use_centering_matches_default, this path must not
-        # be reachable for training. Forward-only usage (no gradients)
-        # would still be mathematically fine, but there is currently no
-        # way to request "forward-only" at the config level, so we block
-        # construction entirely rather than let a trainable call silently
-        # produce wrong dg.
-        if self.use_centering:
+
+        if self.use_centering and not self.unsafe_allow_centering:
             raise NotImplementedError(
-                "use_centering=True is not safe for training: the B4 "
-                "backward kernel (_kernel_b4_body) does not propagate the "
-                "gradient contribution through the shared reference point "
-                "`gn` into dgc (see KNOWN_LIMITATIONS.md). Forward-only "
-                "consumers must call the underlying forward kernels "
-                "directly with an unfrozen dataclasses.replace(...) config "
-                "and take responsibility for not differentiating through "
-                "it; the public KernelConfig refuses to construct this "
-                "config to prevent accidental use in gdn2_pallas_forward_trainable."
+                "use_centering=True requires explicit acknowledgement via "
+                "unsafe_allow_centering=True.\n\n"
+                "Status (see KNOWN_LIMITATIONS.md section 1/6): the B4 "
+                "backward kernel's dgn-gradient path (`_kernel_b4_body`, "
+                "`dgn_acc`) has been independently validated against "
+                "jax.vjp of an isolated reference on production shape "
+                "(bt=256, 5 seeds, dq/dk/db/dgc including the n_mid row) "
+                "with rel_err ~1e-6, and gives measured TPU speedups of "
+                "9.2x (Kernel A forward) and 12.7x (B4 backward) via MXU "
+                "factorization instead of VPU broadcast-reduce. This is "
+                "promising but has NOT yet been run through the full "
+                "deep-correctness suite (multi-seed vs token-serial "
+                "reference through the complete custom_vjp pipeline, "
+                "wy_eps>0 interaction, KAGGLE_SMALL blocking, bf16 "
+                "coverage) -- see "
+                "tests/extended/test_gdn2_deep_correctness_centering.py.\n\n"
+                "If you are deliberately running a controlled experiment "
+                "(isolated kernel test, benchmark, or the deep-correctness "
+                "suite above) and understand this is not yet the default, "
+                "gated path, construct this config with "
+                "unsafe_allow_centering=True to proceed. Do NOT set this "
+                "in a KAGGLE_* preset or in any config passed to "
+                "gdn2_pallas_forward_trainable in production training "
+                "until the suite above has been run and the finding "
+                "reported (then this gate should be replaced by lifting "
+                "use_centering into the public presets directly, per the "
+                "v0.2.0 roadmap item)."
             )
 
 
