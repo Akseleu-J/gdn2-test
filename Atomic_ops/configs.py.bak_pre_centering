@@ -20,7 +20,7 @@ class KernelConfig:
     mb: int = 16
     clip: float = 1e4
     wy_eps: float = 0.0
-    use_centering: bool = True
+    use_centering: bool = False
     # Explicit, opt-in acknowledgement required to construct a
     # use_centering=True config. Defaults to False so the safety gate below
     # still fires for anyone who did not deliberately set this. This exists
@@ -67,20 +67,41 @@ class KernelConfig:
         if not (0.0 <= self.wy_eps < 1.0):
             raise ValueError(f"wy_eps={self.wy_eps} must be in [0, 1)")
 
-        # NOTE: use_centering=True больше не гейтится -- теперь дефолт
-        # во всех KAGGLE_* пресетах и DEFAULT_CONFIG. Для старого
-        # (pre-centering) VPU-пути передайте use_centering=False явно.
+        if self.use_centering and not self.unsafe_allow_centering:
+            raise NotImplementedError(
+                "use_centering=True requires explicit acknowledgement via "
+                "unsafe_allow_centering=True.\n\n"
+                "Status (see KNOWN_LIMITATIONS.md section 1/6): the B4 "
+                "backward kernel's dgn-gradient path (`_kernel_b4_body`, "
+                "`dgn_acc`) has been independently validated against "
+                "jax.vjp of an isolated reference on production shape "
+                "(bt=256, 5 seeds, dq/dk/db/dgc including the n_mid row) "
+                "with rel_err ~1e-6, and gives measured TPU speedups of "
+                "9.2x (Kernel A forward) and 12.7x (B4 backward) via MXU "
+                "factorization instead of VPU broadcast-reduce. This is "
+                "promising but has NOT yet been run through the full "
+                "deep-correctness suite (multi-seed vs token-serial "
+                "reference through the complete custom_vjp pipeline, "
+                "wy_eps>0 interaction, KAGGLE_SMALL blocking, bf16 "
+                "coverage) -- see "
+                "tests/extended/test_gdn2_deep_correctness_centering.py.\n\n"
+                "If you are deliberately running a controlled experiment "
+                "(isolated kernel test, benchmark, or the deep-correctness "
+                "suite above) and understand this is not yet the default, "
+                "gated path, construct this config with "
+                "unsafe_allow_centering=True to proceed. Do NOT set this "
+                "in a KAGGLE_* preset or in any config passed to "
+                "gdn2_pallas_forward_trainable in production training "
+                "until the suite above has been run and the finding "
+                "reported (then this gate should be replaced by lifting "
+                "use_centering into the public presets directly, per the "
+                "v0.2.0 roadmap item)."
+            )
 
 
-KAGGLE_SMALL = KernelConfig(bt=128, bc=64, mb=16, clip=1e4, wy_eps=1e-3, use_centering=True)
-KAGGLE_MEDIUM = KernelConfig(bt=256, bc=128, mb=16, clip=1e4, wy_eps=1e-3, use_centering=True)
-KAGGLE_LARGE = KernelConfig(bt=256, bc=128, mb=16, clip=5e3, wy_eps=1e-3, use_centering=True)
-
-# Pre-centering путь -- для A/B сравнения (speed/memory "до/после").
-# Не используется дефолтными entrypoint-ами.
-KAGGLE_SMALL_NOCENTER = KernelConfig(bt=128, bc=64, mb=16, clip=1e4, wy_eps=1e-3, use_centering=False)
-KAGGLE_MEDIUM_NOCENTER = KernelConfig(bt=256, bc=128, mb=16, clip=1e4, wy_eps=1e-3, use_centering=False)
-KAGGLE_LARGE_NOCENTER = KernelConfig(bt=256, bc=128, mb=16, clip=5e3, wy_eps=1e-3, use_centering=False)
+KAGGLE_SMALL = KernelConfig(bt=128, bc=64, mb=16, clip=1e4, wy_eps=1e-3)
+KAGGLE_MEDIUM = KernelConfig(bt=256, bc=128, mb=16, clip=1e4, wy_eps=1e-3)
+KAGGLE_LARGE = KernelConfig(bt=256, bc=128, mb=16, clip=5e3, wy_eps=1e-3)
 DEFAULT_CONFIG = KAGGLE_MEDIUM
 
 
