@@ -55,10 +55,6 @@ def _kernel_a_body(q_ref, k_ref, b_ref, g_ref, aqk_ref, akk_ref, *, scale: float
     aqk_ref[0, 0, 0] = jnp.zeros((bt, bt), dtype=jnp.float32)
     akk_ref[0, 0, 0] = jnp.zeros((bt, bt), dtype=jnp.float32)
 
-    if use_centering:
-        n_mid = bt // 2
-        gn = gc[n_mid]   # (D,), shared reference point for the whole BT chunk
-
     for si in range(n_sub):
         for sj in range(si + 1):
             i0, i1 = si * bc, (si + 1) * bc
@@ -72,13 +68,35 @@ def _kernel_a_body(q_ref, k_ref, b_ref, g_ref, aqk_ref, akk_ref, *, scale: float
             gc_j = gc[j0:j1]
 
             if use_centering:
-                gq_i = jnp.clip(gc_i - gn[None, :], -20.0, 20.0)
-                gk_j = jnp.clip(gn[None, :] - gc_j, -20.0, 20.0)
+                # FIX (per-pair local centering -- replaces single shared
+                # gn=gc[n_mid] for the whole bt chunk). The old scheme let
+                # exp(gc_i-gn)/exp(gn-gc_j) span up to the full chunk
+                # (not just this (si,sj) pair), which could saturate the
+                # [-20,20] clip on blocks where the TRUE gc_i-gc_j span
+                # was still small -- Aqk/Akk would then stop depending
+                # correctly on q_i/k_j (leakage), not a legitimate decay
+                # zeroing. Fix: reference points LOCAL to this pair --
+                # gn_i = start of query block si, gn_j = end of key block
+                # sj -- and decompose
+                #   gc_i - gc_j = (gc_i - gn_i) + (gn_i - gn_j) + (gn_j - gc_j)
+                # First/third terms now span at most bc tokens (always
+                # safe to clip). The middle "cross" term can legitimately
+                # saturate for distant blocks -- that's correct zeroing.
+                gn_i = gc[i0]        # (D,) start of query block si
+                gn_j = gc[j1 - 1]    # (D,) end of key block sj
+
+                gq_i = jnp.clip(gc_i - gn_i[None, :], -20.0, 20.0)
+                gk_j = jnp.clip(gn_j[None, :] - gc_j, -20.0, 20.0)
+                gcross = jnp.clip(gn_i - gn_j, -20.0, 20.0)
+
                 eq_i = jnp.exp(gq_i)
                 ek_j = jnp.exp(gk_j)
+                ecross = jnp.exp(gcross)
+
                 q_scaled = q_i * eq_i
-                k_scaled = k_j * ek_j
+                k_scaled = (k_j * ek_j) * ecross[None, :]
                 bk_scaled = (b_i * k_i) * eq_i
+
                 aqk_blk = scale * jnp.dot(q_scaled, k_scaled.T, precision=_HIGHEST)
                 akk_blk = jnp.dot(bk_scaled, k_scaled.T, precision=_HIGHEST)
             else:
@@ -97,7 +115,6 @@ def _kernel_a_body(q_ref, k_ref, b_ref, g_ref, aqk_ref, akk_ref, *, scale: float
 
             aqk_ref[0, 0, 0, i0:i1, j0:j1] = sanitize(aqk_blk, config)
             akk_ref[0, 0, 0, i0:i1, j0:j1] = sanitize(akk_blk, config)
-
 
 def build_chunk_scores_pallas(q, k, b, g, scale, config: KernelConfig = DEFAULT_CONFIG, interpret: bool = False):
     bsz, L, H, D = q.shape
