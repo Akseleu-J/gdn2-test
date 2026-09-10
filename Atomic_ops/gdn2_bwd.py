@@ -267,18 +267,17 @@ def _kernel_b4_body(q_ref, k_ref, b_ref, g_ref, daqk_ref, dakk_ref,
     db_ref[0, 0, 0] = jnp.zeros_like(k_full)
     dgc_ref[0, 0, 0] = jnp.zeros_like(g_raw)
 
-    # use_centering=True: the forward factorizes the pairwise decay
-    # exp(gc_i - gc_j) as eq_i * ek_j, where eq_i = exp(clip(gc_i - gn))
-    # and ek_j = exp(clip(gn - gc_j)) both reference a single shared
-    # per-chunk vector gn = gc[n_mid]. Because gn is reused across every
-    # (si, sj) sub-block, its gradient contribution must be accumulated
-    # across the whole double loop (dgn_acc) and then scattered into
-    # dgc_ref at row n_mid exactly once, after the loop -- mirroring how
-    # B3 scatters dgc_last_total onto the last row via `row_mask`.
+    # FIX (per-pair local centering, backward half -- mirrors the forward
+    # change in gdn2_fwd.py's _kernel_a_body). gn_i depends only on si
+    # (=gc[i0]); gn_j depends only on sj (=gc[j1-1]). Both are shared
+    # across every pair that reuses the same si (resp. sj), so their
+    # gradients must be accumulated across the WHOLE double loop before
+    # being scattered -- same pattern as the old single-gn dgn_acc, just
+    # with n_sub independent accumulators per side instead of one.
     if use_centering:
-        n_mid = bt // 2
-        gn = gc[n_mid]
-        dgn_acc = jnp.zeros_like(gn)   # accumulated across every sub-block this step
+        D = q_full.shape[-1]
+        dgn_i_acc = [jnp.zeros((D,), dtype=jnp.float32) for _ in range(n_sub)]
+        dgn_j_acc = [jnp.zeros((D,), dtype=jnp.float32) for _ in range(n_sub)]
 
     for si in range(n_sub):
         for sj in range(si + 1):
@@ -303,16 +302,27 @@ def _kernel_b4_body(q_ref, k_ref, b_ref, g_ref, daqk_ref, dakk_ref,
                 dM_kk = dM_kk * strict
 
             if use_centering:
-                gq_i_raw = gc_i - gn[None, :]
-                gk_j_raw = gn[None, :] - gc_j
+                gn_i = gc[i0]
+                gn_j = gc[j1 - 1]
+
+                gq_i_raw = gc_i - gn_i[None, :]
+                gk_j_raw = gn_j[None, :] - gc_j
+                gcross_raw = gn_i - gn_j
+
                 gq_i = jnp.clip(gq_i_raw, -20.0, 20.0)
                 gk_j = jnp.clip(gk_j_raw, -20.0, 20.0)
+                gcross = jnp.clip(gcross_raw, -20.0, 20.0)
+
                 clipmask_q = ((gq_i_raw >= -20.0) & (gq_i_raw <= 20.0)).astype(jnp.float32)
                 clipmask_k = ((gk_j_raw >= -20.0) & (gk_j_raw <= 20.0)).astype(jnp.float32)
+                clipmask_cross = ((gcross_raw >= -20.0) & (gcross_raw <= 20.0)).astype(jnp.float32)
+
                 eq_i = jnp.exp(gq_i)
                 ek_j = jnp.exp(gk_j)
+                ecross = jnp.exp(gcross)
+
                 q_scaled = q_i * eq_i
-                k_scaled = k_j * ek_j
+                k_scaled = (k_j * ek_j) * ecross[None, :]
                 bk_scaled = bk_i * eq_i
 
                 dq_scaled = scale * jnp.dot(dM_qk, k_scaled, precision=_HIGHEST)
@@ -321,23 +331,29 @@ def _kernel_b4_body(q_ref, k_ref, b_ref, g_ref, daqk_ref, dakk_ref,
                 dk_scaled_kk = jnp.dot(dM_kk.T, bk_scaled, precision=_HIGHEST)
                 dk_scaled = dk_scaled_qk + dk_scaled_kk
 
-                dk_j_from_scaled = dk_scaled * ek_j
-                dgk_j = (dk_scaled * k_scaled) * clipmask_k
+                # -- into k_j / ek_j / ecross --
+                dk_j_from_scaled = dk_scaled * ek_j * ecross[None, :]
+                dB = dk_scaled * k_j * ecross[None, :]           # d/d(ek_j)
+                dgk_j = (dB * ek_j) * clipmask_k                 # d/d(gk_j_raw)
+                dC = jnp.sum(dk_scaled * k_j * ek_j, axis=0)     # d/d(ecross), (D,)
+                dgcross = (dC * ecross) * clipmask_cross         # d/d(gcross_raw), (D,)
 
+                # -- into q_i / bk_i / eq_i --
                 d_eq_i_total = dq_scaled * q_i + dbk_scaled * bk_i
                 dgq_i = (d_eq_i_total * eq_i) * clipmask_q
                 dq_i_from_scaled = dq_scaled * eq_i
-                dbk_i_from_scaled = dbk_scaled * eq_i   # d(b_i*k_i)
+                dbk_i_from_scaled = dbk_scaled * eq_i
 
                 dq_ref[0, 0, 0, i0:i1] = clip_acc(dq_ref[0, 0, 0, i0:i1] + dq_i_from_scaled, config)
                 db_ref[0, 0, 0, i0:i1] = clip_acc(db_ref[0, 0, 0, i0:i1] + dbk_i_from_scaled, config)
                 dk_ref[0, 0, 0, j0:j1] = clip_acc(dk_ref[0, 0, 0, j0:j1] + dk_j_from_scaled, config)
                 dgc_ref[0, 0, 0, i0:i1] = clip_acc(dgc_ref[0, 0, 0, i0:i1] + dgq_i, config)
                 dgc_ref[0, 0, 0, j0:j1] = clip_acc(dgc_ref[0, 0, 0, j0:j1] - dgk_j, config)
-                # d(gq_i)/d(gn) = -1, d(gk_j)/d(gn) = +1 (within the clip
-                # window; clipmask_q/clipmask_k already zero the
-                # out-of-window terms consistently with dgq_i/dgk_j).
-                dgn_acc = dgn_acc + jnp.sum(dgk_j, axis=0) - jnp.sum(dgq_i, axis=0)
+
+                # d(gn_i)/d(gq_i_raw) = -1 (in-window); d(gn_i)/d(gcross_raw) = +1
+                dgn_i_acc[si] = dgn_i_acc[si] + jnp.sum(-dgq_i, axis=0) + dgcross
+                # d(gn_j)/d(gk_j_raw) = +1 (in-window); d(gn_j)/d(gcross_raw) = -1
+                dgn_j_acc[sj] = dgn_j_acc[sj] + jnp.sum(dgk_j, axis=0) - dgcross
             else:
                 decay_diff = gc_i[:, None, :] - gc_j[None, :, :]
                 clipmask = ((decay_diff >= -20.0) & (decay_diff <= 20.0)).astype(jnp.float32)
@@ -361,15 +377,18 @@ def _kernel_b4_body(q_ref, k_ref, b_ref, g_ref, daqk_ref, dakk_ref,
                 dgc_ref[0, 0, 0, i0:i1] = clip_acc(dgc_ref[0, 0, 0, i0:i1] + dgc_i_qk + dgc_i_kk, config)
                 dgc_ref[0, 0, 0, j0:j1] = clip_acc(dgc_ref[0, 0, 0, j0:j1] + dgc_j_qk + dgc_j_kk, config)
 
-    # FIX (use_centering backward completion): scatter the accumulated
-    # d(Loss)/d(gn) contribution onto row n_mid of dgc_ref. Before this
-    # line, dgn_acc was computed correctly but never written anywhere,
-    # so the gradient w.r.t. g through the shared reference point gn was
-    # silently dropped whenever use_centering=True. This is the row-wise
-    # analogue of B3's `row_mask` scatter of dgc_last_total onto the
-    # last row of dgc.
+    # FIX: scatter accumulated d(Loss)/d(gn_i), d(Loss)/d(gn_j) onto the
+    # rows they reference (gn_i=gc[i0] start-of-block-si, gn_j=gc[j1-1]
+    # end-of-block-sj). Each accumulator sums contributions from every
+    # pair sharing that si (resp. sj) -- generalizes the old single n_mid
+    # scatter to n_sub independent points per side.
     if use_centering:
-        dgc_ref[0, 0, 0, n_mid] = clip_acc(dgc_ref[0, 0, 0, n_mid] + dgn_acc, config)
+        for si in range(n_sub):
+            i0 = si * bc
+            dgc_ref[0, 0, 0, i0] = clip_acc(dgc_ref[0, 0, 0, i0] + dgn_i_acc[si], config)
+        for sj in range(n_sub):
+            j_last = (sj + 1) * bc - 1
+            dgc_ref[0, 0, 0, j_last] = clip_acc(dgc_ref[0, 0, 0, j_last] + dgn_j_acc[sj], config)
 
     dbk_final = db_ref[0, 0, 0]
     dk_final = dk_ref[0, 0, 0] + dbk_final * b_full
@@ -381,7 +400,6 @@ def _kernel_b4_body(q_ref, k_ref, b_ref, g_ref, daqk_ref, dakk_ref,
     dk_ref[0, 0, 0] = sanitize(dk_final, config)
     db_ref[0, 0, 0] = sanitize(db_final, config)
     dgc_ref[0, 0, 0] = sanitize(dgc_final, config)
-
 def intra_backward_pallas(dAqk, dAkk, q, k, b, g, scale, config: KernelConfig = DEFAULT_CONFIG, interpret: bool = False):
     bsz, L, H, D = q.shape
     n_chunks = L // config.bt
