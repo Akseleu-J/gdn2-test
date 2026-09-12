@@ -387,8 +387,8 @@ def _kernel_b4_body(q_ref, k_ref, b_ref, g_ref, daqk_ref, dakk_ref,
             i0 = si * bc
             dgc_ref[0, 0, 0, i0] = clip_acc(dgc_ref[0, 0, 0, i0] + dgn_i_acc[si], config)
         for sj in range(n_sub):
-            j_last = (sj + 1) * bc - 1
-            dgc_ref[0, 0, 0, j_last] = clip_acc(dgc_ref[0, 0, 0, j_last] + dgn_j_acc[sj], config)
+            j0 = sj * bc
+            dgc_ref[0, 0, 0, j0] = clip_acc(dgc_ref[0, 0, 0, j0] + dgn_j_acc[sj], config)
 
     dbk_final = db_ref[0, 0, 0]
     dk_final = dk_ref[0, 0, 0] + dbk_final * b_full
