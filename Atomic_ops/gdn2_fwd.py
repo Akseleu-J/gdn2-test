@@ -83,8 +83,7 @@ def _kernel_a_body(q_ref, k_ref, b_ref, g_ref, aqk_ref, akk_ref, *, scale: float
                 # safe to clip). The middle "cross" term can legitimately
                 # saturate for distant blocks -- that's correct zeroing.
                 gn_i = gc[i0]        # (D,) start of query block si
-                gn_j = gc[j1 - 1]    # (D,) end of key block sj
-
+                gn_j = gc[j0]
                 gq_i = jnp.clip(gc_i - gn_i[None, :], -20.0, 20.0)
                 gk_j = jnp.clip(gn_j[None, :] - gc_j, -20.0, 20.0)
                 gcross = jnp.clip(gn_i - gn_j, -20.0, 20.0)
