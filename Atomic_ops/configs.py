@@ -20,6 +20,14 @@ class KernelConfig:
     mb: int = 16
     clip: float = 1e4
     wy_eps: float = 0.0
+    # MB8: батч-группа для Kernel B (и fused A+B) по оси n_chunks.
+    # None => группа не задана явно, batched-энтрипойнты сами решают
+    # (по умолчанию используют весь n_chunks как одну группу, если
+    # это не выйдет за vmem_limit_bytes -- см. gdn2_fwd_batched.py).
+    # bt/bc/mb НЕ трогаем -- это отдельная, ортогональная ось батчинга
+    # (grid-dispatch overhead, MB8_status_report.md), не связанная с
+    # MXU-факторизацией use_centering.
+    b_batch_group: int | None = None
     use_centering: bool = True
     # Explicit, opt-in acknowledgement required to construct a
     # use_centering=True config. Defaults to False so the safety gate below
