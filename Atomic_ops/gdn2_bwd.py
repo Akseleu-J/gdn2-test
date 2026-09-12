@@ -303,7 +303,7 @@ def _kernel_b4_body(q_ref, k_ref, b_ref, g_ref, daqk_ref, dakk_ref,
 
             if use_centering:
                 gn_i = gc[i0]
-                gn_j = gc[j1 - 1]
+                gn_j = gc[j0]
 
                 gq_i_raw = gc_i - gn_i[None, :]
                 gk_j_raw = gn_j[None, :] - gc_j
