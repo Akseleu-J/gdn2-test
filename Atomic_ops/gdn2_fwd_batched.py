@@ -179,14 +179,15 @@ def wy_solve_pallas_batched(Akk, config: KernelConfig = DEFAULT_CONFIG,
     if group is None:
         group = config.b_batch_group if config.b_batch_group is not None else n_chunks
 
-    if group > _MAX_VALIDATED_GROUP:
+    max_validated = _max_validated_group(config.bt)
+    if group > max_validated:
         warnings.warn(
             f"wy_solve_pallas_batched: group={group} превышает диапазон, "
-            f"измеренный в MB8_status_report.md (до group={_MAX_VALIDATED_GROUP} "
-            f"на train_shape). При n_chunks=64 группа=128 упала в VMEM OOM "
-            f"в исходном эксперименте -- задайте b_batch_group явно и "
-            f"подберите под ваш vmem_limit_bytes, не полагайтесь на дефолт "
-            f"group=n_chunks для длинных последовательностей.",
+            f"измеренный/выведенный по формуле для bt={config.bt} "
+            f"(max_validated={max_validated}; см. MB8_status_report.md). "
+            f"Задайте b_batch_group явно и подберите под ваш "
+            f"vmem_limit_bytes, не полагайтесь на дефолт group=n_chunks "
+            f"для длинных последовательностей.",
             RuntimeWarning,
         )
 
