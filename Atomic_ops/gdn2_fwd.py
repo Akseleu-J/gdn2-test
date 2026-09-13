@@ -7,6 +7,11 @@ Pallas kernel bodies now explicitly passes `config`, so that KernelConfig.clip
 instead of silently falling back to sanitize()'s Python default argument
 (DEFAULT_CONFIG). See test_clip_config_plumbing.py for the regression test
 this fixes.
+
+PATCH (interpret plumbing): `interpret=` is now forwarded through
+wy_solve_pallas / recompute_wy_pallas / gdn2_pallas_forward(_with_residuals)
+so the whole pipeline can be run on CPU with interpret=True. Default False
+preserves TPU behavior bit-for-bit.
 """
 from __future__ import annotations
 
@@ -114,6 +119,7 @@ def _kernel_a_body(q_ref, k_ref, b_ref, g_ref, aqk_ref, akk_ref, *, scale: float
 
             aqk_ref[0, 0, 0, i0:i1, j0:j1] = sanitize(aqk_blk, config)
             akk_ref[0, 0, 0, i0:i1, j0:j1] = sanitize(akk_blk, config)
+
 
 def build_chunk_scores_pallas(q, k, b, g, scale, config: KernelConfig = DEFAULT_CONFIG, interpret: bool = False):
     bsz, L, H, D = q.shape
@@ -235,7 +241,7 @@ def _kernel_b_body(akk_ref, a_ref, *, bt: int, bc: int, config: KernelConfig):
     a_ref[0, 0, 0, bc:2*bc, bc:2*bc] = A11
 
 
-def wy_solve_pallas(Akk, config: KernelConfig = DEFAULT_CONFIG):
+def wy_solve_pallas(Akk, config: KernelConfig = DEFAULT_CONFIG, interpret: bool = False):
     """Solves A = (I + (1 - config.wy_eps) * Akk)^-1 via block-recursive
     WY forward substitution. `Akk` must be the RAW (undamped) matrix from
     build_chunk_scores_pallas -- damping is applied exactly once, inside
@@ -244,7 +250,7 @@ def wy_solve_pallas(Akk, config: KernelConfig = DEFAULT_CONFIG):
     history -- pre-damping here caused an effective (1-wy_eps)^2 solve
     that silently diverged from the inference-only gdn2_pallas_forward
     path and from what the B3 backward kernel assumes)."""
-    bsz, H, n_chunks = Akk.shape[:3]
+    bsz, H, n_chunks = Akk.shape[:3]              # <-- FIX: был нулевой отступ
     # NOTE: та же проверка, что и внутри _kernel_b_body -- дублируется
     # здесь намеренно, чтобы падать ДО трейсинга/компиляции Pallas-кернела.
     assert config.bt == 2 * config.bc, (
@@ -261,6 +267,7 @@ def wy_solve_pallas(Akk, config: KernelConfig = DEFAULT_CONFIG):
         out_specs=spec,
         out_shape=jax.ShapeDtypeStruct(Akk.shape, jnp.float32),
         compiler_params=pltpu.CompilerParams(vmem_limit_bytes=96 * 1024 * 1024),
+        interpret=interpret,
     )(Akk)
     return A
 
@@ -300,7 +307,8 @@ def _kernel_c_body(q_ref, k_ref, v_ref, w_ref, b_ref, g_ref, a_ref,
     gc_last_ref[0, 0, 0, 0] = gc_last_row
 
 
-def recompute_wy_pallas(q, k, v, w, b, g, A, config: KernelConfig = DEFAULT_CONFIG):
+def recompute_wy_pallas(q, k, v, w, b, g, A, config: KernelConfig = DEFAULT_CONFIG,
+                        interpret: bool = False):                       # <-- FIX: добавлен interpret
     bsz, L, H, D = q.shape
     n_chunks = L // config.bt
 
@@ -327,6 +335,7 @@ def recompute_wy_pallas(q, k, v, w, b, g, A, config: KernelConfig = DEFAULT_CONF
             jax.ShapeDtypeStruct((bsz, H, n_chunks, 1, D), jnp.float32),
         ],
         compiler_params=pltpu.CompilerParams(vmem_limit_bytes=64 * 1024 * 1024),
+        interpret=interpret,
     )(q_r, k_r, v_r, w_r, b_r, g_r, A)
 
     gc_last = gc_last.reshape(bsz, H, n_chunks, D)
@@ -398,17 +407,24 @@ def gdn2_inter_chunk_combine_with_state(Aqk, w_pseudo, u, kg, qg, gc_last, scale
 
 
 def gdn2_pallas_forward(q, k, v, w, b, g, scale, h0=None,
-                        config: KernelConfig = DEFAULT_CONFIG, debug_tag: str = ""):
-    from .gdn2_fwd_batched import wy_solve_pallas_batched
+                        config: KernelConfig = DEFAULT_CONFIG, debug_tag: str = "",
+                        interpret: bool = False):
     bsz, L, H, D, n_chunks = validate_inputs(q, k, v, w, b, g, scale, h0, config)
 
-    Aqk, Akk = build_chunk_scores_pallas(q, k, b, g, scale, config)
+    # Local import to avoid a top-level circular import (gdn2_fwd_batched
+    # imports from gdn2_fwd).
+    from .gdn2_fwd_batched import wy_solve_pallas_batched
+
+    Aqk, Akk = build_chunk_scores_pallas(q, k, b, g, scale, config, interpret=interpret)
     Aqk = _stage_diag(f"{debug_tag}:kernel_A_Aqk", Aqk)
     Akk = _stage_diag(f"{debug_tag}:kernel_A_Akk", Akk)
 
-    A = wy_solve_pallas_batched(Akk, config)
+    A = wy_solve_pallas_batched(Akk, config, interpret=interpret)
     A = _stage_diag(f"{debug_tag}:kernel_B_wy_inverse_A", A)
-    w_pseudo, u, kg, qg, gc_last = recompute_wy_pallas(q, k, v, w, b, g, A, config)
+
+    w_pseudo, u, kg, qg, gc_last = recompute_wy_pallas(
+        q, k, v, w, b, g, A, config, interpret=interpret,
+    )
     w_pseudo = _stage_diag(f"{debug_tag}:kernel_C_w_pseudo", w_pseudo)
     u = _stage_diag(f"{debug_tag}:kernel_C_u", u)
     kg = _stage_diag(f"{debug_tag}:kernel_C_kg", kg)
@@ -423,22 +439,29 @@ def gdn2_pallas_forward(q, k, v, w, b, g, scale, h0=None,
 
 def gdn2_pallas_forward_with_residuals(q, k, v, w, b, g, scale, h0=None,
                                         config: KernelConfig = DEFAULT_CONFIG,
-                                        debug_tag: str = ""):
+                                        debug_tag: str = "", interpret: bool = False):
     bsz, L, H, D, n_chunks = validate_inputs(q, k, v, w, b, g, scale, h0, config)
 
-    Aqk, Akk = build_chunk_scores_pallas(q, k, b, g, scale, config)
+    # Local import -- same reason as in gdn2_pallas_forward above. This
+    # import was missing in the previous revision (NameError at runtime).
+    from .gdn2_fwd_batched import wy_solve_pallas_batched
+
+    Aqk, Akk = build_chunk_scores_pallas(q, k, b, g, scale, config, interpret=interpret)
     Aqk = _stage_diag(f"{debug_tag}:kernel_A_Aqk", Aqk)
     Akk = _stage_diag(f"{debug_tag}:kernel_A_Akk", Akk)
 
-    # FIX (double-damping bug): wy_solve_pallas already applies
+    # FIX (double-damping bug): wy_solve_pallas(_batched) already applies
     # (1 - config.wy_eps) damping internally (see _kernel_b_body /
     # _block_solve). Pass the RAW Akk here too, so both forward entry
     # points solve the identical system and gdn2_pallas_forward_trainable's
     # primal output matches gdn2_pallas_forward bit-for-bit (see
     # test_forward_and_trainable_forward_agree_exactly).
-    A = wy_solve_pallas_batched(Akk, config)
+    A = wy_solve_pallas_batched(Akk, config, interpret=interpret)
     A = _stage_diag(f"{debug_tag}:kernel_B_wy_inverse_A", A)
-    w_pseudo, u, kg, qg, gc_last = recompute_wy_pallas(q, k, v, w, b, g, A, config)
+
+    w_pseudo, u, kg, qg, gc_last = recompute_wy_pallas(
+        q, k, v, w, b, g, A, config, interpret=interpret,
+    )
     w_pseudo = _stage_diag(f"{debug_tag}:kernel_C_w_pseudo", w_pseudo)
     u = _stage_diag(f"{debug_tag}:kernel_C_u", u)
     kg = _stage_diag(f"{debug_tag}:kernel_C_kg", kg)
