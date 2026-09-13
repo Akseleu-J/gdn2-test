@@ -1,6 +1,16 @@
 """
 Pure-JAX reference implementations for GDN-2.
 Token-serial (ground truth) and chunked-WY (backward fallback / cross-check).
+
+PATCH (P0.2, clip-plumbing fix): _build_chunk_wy / gdn2_chunked_wy_reference
+now accept an explicit `clip` parameter instead of hardcoding 1e4/-1e4. This
+mirrors the same fix already applied to the Pallas kernel bodies
+(gdn2_fwd.py / gdn2_bwd.py, see test_clip_config_plumbing.py) -- without it,
+KAGGLE_LARGE (clip=5e3) would silently diverge from KAGGLE_MEDIUM/SMALL
+(clip=1e4) only on the CPU/fallback path, while the TPU path used the
+correct per-config clip everywhere. Default clip=1e4 preserves the original
+hardcoded behavior for anyone calling these functions directly without a
+config.
 """
 from __future__ import annotations
 
@@ -8,6 +18,25 @@ import jax
 import jax.numpy as jnp
 
 _HIGHEST = jax.lax.Precision.HIGHEST
+
+
+def _sanitize_ref(x, clip: float):
+    """Mirrors configs.sanitize()/gdn2_fwd.sanitize() exactly: a REAL
+    jnp.clip(x, -clip, clip) followed by nan_to_num. This matters because
+    plain jnp.nan_to_num(x, posinf=clip, neginf=-clip) (used throughout
+    the rest of this file before this patch) only replaces actual +-inf
+    values -- it does NOT bound large-but-finite values the way the
+    Pallas kernels' sanitize() does. Concretely: nan_to_num alone lets
+    w_pseudo/u grow to 1e18-1e22 on aggressive inputs (e.g. large k/b
+    scale) while the Pallas path is hard-clipped to +-config.clip at the
+    same call site. Without this fix, P0.2's clip *parameter* would be
+    correctly threaded through but still functionally a no-op for most
+    of the values in this function, and the reference path would remain
+    numerically incomparable to the Pallas path on any input aggressive
+    enough to matter (see extreme_large_kb in test1.py/test2.py, which
+    produces nan in the token-serial reference on exactly this class of
+    input)."""
+    return jnp.nan_to_num(jnp.clip(x, -clip, clip), nan=0.0, posinf=clip, neginf=-clip)
 
 
 def _wy_inverse(Akk, eps: float = 0.0):
@@ -67,7 +96,8 @@ def gdn2_token_serial_reference(q, k, v, g, b, w, scale, h0=None):
     return o, h_final
 
 
-def _build_chunk_wy(q_c, k_c, v_c, g_raw_c, b_c, w_c, scale, wy_eps: float = 0.0):
+def _build_chunk_wy(q_c, k_c, v_c, g_raw_c, b_c, w_c, scale, wy_eps: float = 0.0,
+                     clip: float = 1e4):
     C = q_c.shape[1]
     f32 = jnp.float32
 
@@ -87,17 +117,17 @@ def _build_chunk_wy(q_c, k_c, v_c, g_raw_c, b_c, w_c, scale, wy_eps: float = 0.0
     bk_bhcd = b_bhcd * k_bhcd
     Akk = jnp.einsum("bhid,bhijd,bhjd->bhij", bk_bhcd, edecay, k_bhcd, precision=_HIGHEST) * strict
 
-    Aqk = jnp.nan_to_num(Aqk, nan=0.0, posinf=1e4, neginf=-1e4)
-    Akk = jnp.nan_to_num(Akk, nan=0.0, posinf=1e4, neginf=-1e4)
+    Aqk = _sanitize_ref(Aqk, clip)
+    Akk = _sanitize_ref(Akk, clip)
 
     A = _wy_inverse(Akk, eps=wy_eps)
-    A = jnp.nan_to_num(A, nan=0.0, posinf=1e4, neginf=-1e4)
+    A = _sanitize_ref(A, clip)
 
     kb_decayed = (b_c.astype(f32) * k_c.astype(f32)) * jnp.exp(gc)
     w_pseudo = jnp.einsum("bhij,bjhd->bihd", A, kb_decayed, precision=_HIGHEST)
     u = jnp.einsum("bhij,bjhv->bihv", A, (w_c * v_c).astype(f32), precision=_HIGHEST)
-    w_pseudo = jnp.nan_to_num(w_pseudo, nan=0.0, posinf=1e4, neginf=-1e4)
-    u = jnp.nan_to_num(u, nan=0.0, posinf=1e4, neginf=-1e4)
+    w_pseudo = _sanitize_ref(w_pseudo, clip)
+    u = _sanitize_ref(u, clip)
 
     gc_last = gc[:, -1]
     kg = k_c.astype(f32) * jnp.exp(gc_last[:, None] - gc)
@@ -106,13 +136,19 @@ def _build_chunk_wy(q_c, k_c, v_c, g_raw_c, b_c, w_c, scale, wy_eps: float = 0.0
     return Aqk, w_pseudo, u, kg, qg, gc_last
 
 
-def gdn2_chunked_wy_reference(q, k, v, g, b, w, scale, chunk_size, h0=None, wy_eps: float = 0.0):
+def gdn2_chunked_wy_reference(q, k, v, g, b, w, scale, chunk_size, h0=None, wy_eps: float = 0.0,
+                               clip: float = 1e4):
     """Chunked-WY reference with jax.checkpoint for memory efficiency.
 
     wy_eps: pass config.wy_eps here when using this as a cross-check
     against the Pallas path (gdn2_pallas_forward_trainable), otherwise the
     two paths solve slightly different problems on near-singular chunks
     and comparisons/asserts between them will show spurious mismatches.
+
+    clip: pass config.clip here for the same reason (P0.2) -- otherwise
+    this always clips at the hardcoded 1e4 regardless of which KAGGLE_*
+    preset is active, silently diverging from KAGGLE_LARGE's clip=5e3
+    on the TPU path.
     """
     bsz, L, H, D = q.shape
     Dv = v.shape[-1]
@@ -133,7 +169,9 @@ def gdn2_chunked_wy_reference(q, k, v, g, b, w, scale, chunk_size, h0=None, wy_e
 
     def chunk_step(h_pre, inputs):
         q_c, k_c, v_c, g_c, b_c, w_c = inputs
-        Aqk, w_pseudo, u, kg, qg, gc_last = _build_chunk_wy(q_c, k_c, v_c, g_c, b_c, w_c, scale, wy_eps=wy_eps)
+        Aqk, w_pseudo, u, kg, qg, gc_last = _build_chunk_wy(
+            q_c, k_c, v_c, g_c, b_c, w_c, scale, wy_eps=wy_eps, clip=clip,
+        )
 
         wh = jnp.einsum("bihd,bhdv->bihv", w_pseudo, h_pre, precision=_HIGHEST)
         v_new = u - wh
@@ -147,8 +185,8 @@ def gdn2_chunked_wy_reference(q, k, v, g, b, w, scale, chunk_size, h0=None, wy_e
         decay_h = jnp.exp(gc_last)[..., None]
         write = jnp.einsum("bihd,bihv->bhdv", kg, v_new, precision=_HIGHEST)
         h_new = h_pre * decay_h + write
-        h_new = jnp.nan_to_num(jnp.clip(h_new, -1e4, 1e4), nan=0.0, posinf=1e4, neginf=-1e4)
-        o_c = jnp.nan_to_num(o_c, nan=0.0, posinf=1e4, neginf=-1e4)
+        h_new = _sanitize_ref(h_new, clip)
+        o_c = _sanitize_ref(o_c, clip)
 
         return h_new, o_c
 
@@ -156,4 +194,4 @@ def gdn2_chunked_wy_reference(q, k, v, g, b, w, scale, chunk_size, h0=None, wy_e
 
     h_final, o_scanned = jax.lax.scan(chunk_step, h0, (q_ch, k_ch, v_ch, g_ch, b_ch, w_ch))
     o = jnp.moveaxis(o_scanned, 0, 1).reshape(bsz, L, H, Dv)
-    return o, h_final
+    return o, h_fina
