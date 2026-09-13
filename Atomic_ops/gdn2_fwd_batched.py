@@ -138,7 +138,20 @@ def wy_solve_pallas_batched(Akk, config: KernelConfig = DEFAULT_CONFIG, group: i
     if n_chunks % group != 0:
         raise ValueError(f"n_chunks={n_chunks} должен делиться на group={group}")
     n_groups = n_chunks // group
+    import warnings
 
+    _MAX_VALIDATED_GROUP = 16  # train_shape, MB8_status_report.md
+
+    if group > _MAX_VALIDATED_GROUP:
+        warnings.warn(
+            f"wy_solve_pallas_batched: group={group} превышает диапазон, "
+            f"измеренный в MB8_status_report.md (до group={_MAX_VALIDATED_GROUP} "
+            f"на train_shape). При n_chunks=64 группа=128 упала в VMEM OOM "
+            f"в исходном эксперименте -- задайте b_batch_group явно и "
+            f"подберите под ваш vmem_limit_bytes, не полагайтесь на дефолт "
+            f"group=n_chunks для длинных последовательностей.",
+            RuntimeWarning,
+        )
     grid = (bsz, H, n_groups)
     spec = pl.BlockSpec((1, 1, group, config.bt, config.bt), lambda i, h, gi: (i, h, gi, 0, 0))
 
