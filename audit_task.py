@@ -1,13 +1,12 @@
-# audit_task.py
 # ============================================================================
-# Задача для Kaggle Benchmarks: глубокий аудит кодовой базы.
+# audit_task.py -- задача для Kaggle Benchmarks CLI.
 #
-# Запуск через CLI:
+# Запуск:
 #   kaggle b t push audit-task -f audit_task.py -d <user>/<codebase-dataset>
 #   kaggle b t run audit-task -m gpt-6-astra --wait
 #
-# Ожидает, что файлы кодовой базы лежат в /kaggle/input/<dataset>/
-# (путь можно переопределить через CODEBASE_ROOT).
+# Ожидает, что кодовая база примонтирована как датасет
+# в /kaggle/input/<dataset>/ (путь можно переопределить через CODEBASE_ROOT).
 # ============================================================================
 
 import os
@@ -21,6 +20,7 @@ CODE_EXTENSIONS = (".py", ".md", ".toml", ".cfg", ".txt")
 EXCLUDE_DIRS = {"__pycache__", ".ipynb_checkpoints", ".git", ".venv"}
 EXCLUDE_FILES = {
     "audit_task.py",
+    "audit_notebook.py",
     "deep_codebase_audit.py",
     "test_gdn2_deep_correctness.py",
     "test_gdn2_deep_correctness_centering.py",
@@ -33,12 +33,12 @@ EXCLUDE_FILES = {
     "test_reference.py",
 }
 
-# Куда примонтирован датасет. Можно переопределить через env var.
+# Куда примонтирован датасет. Переопределяется через env var.
 CODEBASE_ROOT = os.environ.get("CODEBASE_ROOT", "/kaggle/input")
 MAX_CHARS_PER_CHUNK = 700_000  # ~90k токенов
 
 
-# ---------- Хелперы (обычные функции, вызываются из задачи) ----------
+# ---------- Хелперы ----------
 def _collect_files(root_dir):
     files = []
     for dirpath, dirnames, filenames in os.walk(root_dir):
@@ -113,7 +113,7 @@ SYNTH_INSTRUCTIONS = textwrap.dedent("""
 """).strip()
 
 
-# ---------- Задача, которую запускает CLI ----------
+# ---------- Задача для CLI ----------
 @kbench.task(name="audit_codebase")
 def audit_codebase(llm) -> dict:
     """
@@ -124,8 +124,10 @@ def audit_codebase(llm) -> dict:
     files = _collect_files(CODEBASE_ROOT)
     if not files:
         return {
-            "error": f"Не найдено файлов в {CODEBASE_ROOT}. "
-                     f"Убедитесь, что датасет с кодовой базой примонтирован.",
+            "error": (
+                f"Не найдено файлов в {CODEBASE_ROOT}. "
+                f"Убедитесь, что датасет с кодовой базой примонтирован."
+            ),
             "report": "",
         }
 
@@ -145,14 +147,12 @@ def audit_codebase(llm) -> dict:
             f"=== Кодовая база (часть: {chunk_label}) ===\n\n"
             f"{_blob(chunk)}"
         )
-        # Каждый вызов llm.prompt() расходует квоту на сервере Kaggle
         chunk_reports.append({
             "chunk_index": i + 1,
             "files": ", ".join(rel for rel, _ in chunk),
             "report": llm.prompt(prompt),
         })
 
-    # Синтез-проход, если чанков больше одного
     if len(chunk_reports) > 1:
         combined = "\n\n---\n\n".join(
             f"### Чанк {r['chunk_index']} ({r['files']}):\n{r['report']}"
