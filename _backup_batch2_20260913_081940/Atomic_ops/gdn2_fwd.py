@@ -408,50 +408,19 @@ def gdn2_inter_chunk_combine_with_state(Aqk, w_pseudo, u, kg, qg, gc_last, scale
 
 def gdn2_pallas_forward(q, k, v, w, b, g, scale, h0=None,
                         config: KernelConfig = DEFAULT_CONFIG, debug_tag: str = "",
-                        interpret: bool = False, use_fused_ab: bool = False):
-    """
-    use_fused_ab: if True, use build_and_solve_pallas_batched_fixed
-    (Atomic_ops.gdn2_fwd_batched_fixed) instead of the separate
-    build_chunk_scores_pallas + wy_solve_pallas_batched calls. This
-    fuses Kernel A and Kernel B into one pallas_call (removes one HBM
-    roundtrip of Akk between them). INFERENCE-ONLY: this function has
-    no custom_vjp, so flipping this flag cannot silently change
-    training-path gradients. Requires config.b_batch_group to be set
-    (fused kernel takes an explicit group, same constraint as the
-    non-fused batched path). Gate 1 (A2) in gate1_wy_solve_batched.py
-    must PASS on interpret=False for your target shape before setting
-    this True in anything user-facing. gdn2_pallas_forward_with_residuals
-    / gdn2_pallas_forward_trainable are intentionally NOT touched --
-    training stays on the already-integrated non-fused batched path.
-    """
+                        interpret: bool = False):
     bsz, L, H, D, n_chunks = validate_inputs(q, k, v, w, b, g, scale, h0, config)
 
-    # Local imports to avoid a top-level circular import (both batched
-    # modules import from gdn2_fwd).
+    # Local import to avoid a top-level circular import (gdn2_fwd_batched
+    # imports from gdn2_fwd).
     from .gdn2_fwd_batched import wy_solve_pallas_batched
 
-    if use_fused_ab:
-        from .gdn2_fwd_batched_fixed import build_and_solve_pallas_batched_fixed
-        if config.b_batch_group is None:
-            raise ValueError(
-                "use_fused_ab=True requires config.b_batch_group to be "
-                "set explicitly (same constraint as wy_solve_pallas_batched "
-                "-- see the group-selection variants in "
-                "03a_variant_fixed_group.diff / 03b_variant_autosearch_group.py)."
-            )
-        Aqk, A = build_and_solve_pallas_batched_fixed(
-            q, k, b, g, scale, config, group=config.b_batch_group,
-            interpret=interpret,
-        )
-        Aqk = _stage_diag(f"{debug_tag}:kernel_AB_fused_Aqk", Aqk)
-        A = _stage_diag(f"{debug_tag}:kernel_AB_fused_A", A)
-    else:
-        Aqk, Akk = build_chunk_scores_pallas(q, k, b, g, scale, config, interpret=interpret)
-        Aqk = _stage_diag(f"{debug_tag}:kernel_A_Aqk", Aqk)
-        Akk = _stage_diag(f"{debug_tag}:kernel_A_Akk", Akk)
+    Aqk, Akk = build_chunk_scores_pallas(q, k, b, g, scale, config, interpret=interpret)
+    Aqk = _stage_diag(f"{debug_tag}:kernel_A_Aqk", Aqk)
+    Akk = _stage_diag(f"{debug_tag}:kernel_A_Akk", Akk)
 
-        A = wy_solve_pallas_batched(Akk, config, interpret=interpret)
-        A = _stage_diag(f"{debug_tag}:kernel_B_wy_inverse_A", A)
+    A = wy_solve_pallas_batched(Akk, config, interpret=interpret)
+    A = _stage_diag(f"{debug_tag}:kernel_B_wy_inverse_A", A)
 
     w_pseudo, u, kg, qg, gc_last = recompute_wy_pallas(
         q, k, v, w, b, g, A, config, interpret=interpret,

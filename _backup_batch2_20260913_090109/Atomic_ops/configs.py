@@ -95,20 +95,9 @@ class KernelConfig:
 # above. Centering presets kept available, explicitly named, for
 # controlled experiments only (isolated kernel benchmarks, work on the
 # fix itself) -- NOT for production training.
-# b_batch_group values below come from the formula in
-# gdn2_fwd_batched._max_validated_group(bt), which is anchored to the
-# ONE real TPU measurement we have (bt=256 -> group=16, MB8_status_report.md,
-# train_shape n_chunks=16). They are NOT independently re-measured for
-# bt=128/512 -- if you retarget hardware or vmem_limit_bytes, re-run
-# Gate 1 (A) with the new group and update these, don't trust the formula
-# blindly for a preset it wasn't anchored on. See
-# tests/test_preset_group_within_validated_bound.py for the tripwire.
-KAGGLE_SMALL = KernelConfig(bt=128, bc=64, mb=16, clip=1e4, wy_eps=1e-3,
-                             use_centering=False, b_batch_group=64)
-KAGGLE_MEDIUM = KernelConfig(bt=256, bc=128, mb=16, clip=1e4, wy_eps=1e-3,
-                              use_centering=False, b_batch_group=16)
-KAGGLE_LARGE = KernelConfig(bt=256, bc=128, mb=16, clip=5e3, wy_eps=1e-3,
-                             use_centering=False, b_batch_group=16)
+KAGGLE_SMALL = KernelConfig(bt=128, bc=64, mb=16, clip=1e4, wy_eps=1e-3, use_centering=False)
+KAGGLE_MEDIUM = KernelConfig(bt=256, bc=128, mb=16, clip=1e4, wy_eps=1e-3, use_centering=False)
+KAGGLE_LARGE = KernelConfig(bt=256, bc=128, mb=16, clip=5e3, wy_eps=1e-3, use_centering=False)
 DEFAULT_CONFIG = KAGGLE_MEDIUM
 
 # Centering variants -- CONTROLLED EXPERIMENTS ONLY. Requires

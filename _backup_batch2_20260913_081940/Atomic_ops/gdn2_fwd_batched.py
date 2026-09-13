@@ -35,23 +35,7 @@ _HIGHEST = jax.lax.Precision.HIGHEST
 # it's the highest value that has been *validated on a real TPU*. If you
 # set b_batch_group explicitly and exceed this, you get a RuntimeWarning
 # (not an assert) -- you are on your own to check vmem_limit_bytes.
-def _max_validated_group(bt: int) -> int:
-    """Largest `group` for which VMEM safety has actually been measured,
-    as a FUNCTION of `bt` (Current_state.md "срочное" #1 -- replaces the
-    single hardcoded constant that goes stale whenever bt changes). The
-    one real anchor point is bt=256 -> group=16 (MB8_status_report.md,
-    train_shape). The rest follows the same group*bt*bt ~ const scaling
-    implied by the report's own VMEM-OOM curve (n_chunks=64, group=128
-    OOMs at bt=256). This is a WARNING threshold, not a hard assert --
-    same semantics as the old constant, just shape-aware now.
-    """
-    return max(1, (64 * 128 * 128) // (bt * bt))
-
-
-# Kept for anyone importing the old name directly; now derived from the
-# formula above at its one TPU-measured anchor point (bt=256), not
-# hand-maintained as a separate literal.
-_MAX_VALIDATED_GROUP = _max_validated_group(256)
+_MAX_VALIDATED_GROUP = 16
 
 
 # ---------- batched micro forward-substitution ----------
