@@ -399,15 +399,15 @@ def gdn2_inter_chunk_combine_with_state(Aqk, w_pseudo, u, kg, qg, gc_last, scale
 
 def gdn2_pallas_forward(q, k, v, w, b, g, scale, h0=None,
                         config: KernelConfig = DEFAULT_CONFIG, debug_tag: str = ""):
+    from .gdn2_fwd_batched import wy_solve_pallas_batched
     bsz, L, H, D, n_chunks = validate_inputs(q, k, v, w, b, g, scale, h0, config)
 
     Aqk, Akk = build_chunk_scores_pallas(q, k, b, g, scale, config)
     Aqk = _stage_diag(f"{debug_tag}:kernel_A_Aqk", Aqk)
     Akk = _stage_diag(f"{debug_tag}:kernel_A_Akk", Akk)
 
-    A = wy_solve_pallas(Akk, config)
+    A = wy_solve_pallas_batched(Akk, config)
     A = _stage_diag(f"{debug_tag}:kernel_B_wy_inverse_A", A)
-
     w_pseudo, u, kg, qg, gc_last = recompute_wy_pallas(q, k, v, w, b, g, A, config)
     w_pseudo = _stage_diag(f"{debug_tag}:kernel_C_w_pseudo", w_pseudo)
     u = _stage_diag(f"{debug_tag}:kernel_C_u", u)
@@ -436,9 +436,8 @@ def gdn2_pallas_forward_with_residuals(q, k, v, w, b, g, scale, h0=None,
     # points solve the identical system and gdn2_pallas_forward_trainable's
     # primal output matches gdn2_pallas_forward bit-for-bit (see
     # test_forward_and_trainable_forward_agree_exactly).
-    A = wy_solve_pallas(Akk, config)
+    A = wy_solve_pallas_batched(Akk, config)
     A = _stage_diag(f"{debug_tag}:kernel_B_wy_inverse_A", A)
-
     w_pseudo, u, kg, qg, gc_last = recompute_wy_pallas(q, k, v, w, b, g, A, config)
     w_pseudo = _stage_diag(f"{debug_tag}:kernel_C_w_pseudo", w_pseudo)
     u = _stage_diag(f"{debug_tag}:kernel_C_u", u)
