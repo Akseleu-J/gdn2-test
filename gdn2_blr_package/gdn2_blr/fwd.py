@@ -62,7 +62,15 @@ def _vmem_guard(cfg: BLRConfig, need: int, who: str):
         raise RuntimeError(msg)
     warnings.warn(msg, RuntimeWarning)
 
-
+# gdn2_blr/fwd.py -- добавить
+def scores_xla_chunk(q, k, b, g_chunk, scale, cfg: BLRConfig):
+    """q,k,b,g_chunk: (bt, D) -- один чанк, без batch/head/nc осей.
+    XLA-эталон для jax.vjp в G7, без Pallas."""
+    gc = jnp.cumsum(g_chunk.astype(jnp.float32), axis=0)
+    q4 = q[None, None, None]; k4 = k[None, None, None]
+    b4 = b[None, None, None]; gc4 = gc[None, None, None]
+    Aqk, Akk = R.blr_scores_ref(q4, k4, b4, gc4, scale, cfg)
+    return Aqk[0, 0, 0], Akk[0, 0, 0]
 # ===========================================================================
 # Kernel A -- BLR scores
 # ===========================================================================
