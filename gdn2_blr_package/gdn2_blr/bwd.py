@@ -29,8 +29,8 @@ from .config import BLRConfig, fit_heads_per_cell, vmem_kernel_b1, vmem_kernel_b
 from .precision import HIGHEST, make_dot, make_einsum, exp_nonpos, exp_clipped, \
     sanitize
 from .reference import to_chunks, causal_masks
-from .fwd import _cparams, _vmem_guard, vmem_kernel_b4
-
+from .fwd import _cparams, _vmem_guard
+from .config import vmem_kernel_b4
 # ===========================================================================
 # B5 -- reverse cumsum (dgc -> dg)
 # ===========================================================================
