@@ -29,8 +29,7 @@ from .config import BLRConfig, fit_heads_per_cell, vmem_kernel_b1, vmem_kernel_b
 from .precision import HIGHEST, make_dot, make_einsum, exp_nonpos, exp_clipped, \
     sanitize
 from .reference import to_chunks, causal_masks
-from .fwd import _cparams, _vmem_guard
-
+from .fwd import _cparams, _vmem_guard, vmem_kernel_b4
 
 # ===========================================================================
 # B5 -- reverse cumsum (dgc -> dg)
@@ -205,7 +204,115 @@ def wy_dqkg_backward(q, k, b, w, v, gc, A, h_pre, v_new, do, dv, dh_next,
                 dw=sanitize(dw, c_), dv_raw=sanitize(dv_raw, c_),
                 dgc=sanitize(dgc, c_), dAkk=dAkk)
 
+# gdn2_blr_package/gdn2_blr/bwd.py -- добавить
 
+def _kernel_b3_body_pallas(q_ref, k_ref, b_ref, w_ref, v_ref, gc_ref, a_ref,
+                            hpre_ref, vnew_ref, do_ref, dv_ref, dhnext_ref,
+                            dq_ref, dk_ref, db_ref, dw_ref, dvraw_ref, dgc_ref, dakk_ref,
+                            *, scale: float, bt: int, wy_eps: float, cfg: BLRConfig):
+    """Портировано 1:1 из Atomic_ops.gdn2_bwd._kernel_b3_body -- математика
+    B3 не зависит от BLR/three-leg (только от A, h_pre, v_new), поэтому
+    порт безопасен. H2: XLA-версия (wy_dqkg_backward) на TPU оказалась
+    медленнее (~10.7ms) чем этот Pallas-кернел был в старом пакете
+    (~4.6ms) -- вопреки общему правилу §5.1 плана "chunk-parallel в XLA
+    быстрее". Держать обе реализации, выбор через cfg.backend."""
+    dot = make_dot(cfg.dot_mode)
+    q_c = q_ref[0, 0, 0].astype(jnp.float32)
+    k_c = k_ref[0, 0, 0].astype(jnp.float32)
+    b_c = b_ref[0, 0, 0].astype(jnp.float32)
+    w_c = w_ref[0, 0, 0].astype(jnp.float32)
+    v_c = v_ref[0, 0, 0].astype(jnp.float32)
+    gc = gc_ref[0, 0, 0].astype(jnp.float32)
+    A = a_ref[0, 0, 0].astype(jnp.float32)
+    h_pre = hpre_ref[0, 0, 0].astype(jnp.float32)
+    v_new = vnew_ref[0, 0, 0].astype(jnp.float32)
+    do = do_ref[0, 0, 0].astype(jnp.float32)
+    dv = dv_ref[0, 0, 0].astype(jnp.float32)
+    dh_next = dhnext_ref[0, 0, 0].astype(jnp.float32)
+
+    C = bt
+    egc, mgc = exp_nonpos(gc)
+    gc_last = gc[C - 1]
+    ekg, mkg = exp_nonpos(gc_last[None, :] - gc)
+
+    kb_decayed = b_c * k_c * egc
+    kg = k_c * ekg
+    qg = q_c * egc
+    wv = w_c * v_c
+
+    dqh_up = scale * do
+    dqg = dot(dqh_up, h_pre.T)
+    dwh = -dv
+    dw_pseudo = dot(dwh, h_pre.T)
+    du = dv
+    dkg = dot(v_new, dh_next.T)
+
+    dA_from_w = dot(dw_pseudo, kb_decayed.T)
+    dkb_decayed = dot(A.T, dw_pseudo)
+    dA_from_u = dot(du, wv.T)
+    dwv = dot(A.T, du)
+
+    dA_total = sanitize(dA_from_w + dA_from_u, cfg.clip)
+    idx = jnp.arange(C)
+    strict = (idx[:, None] > idx[None, :]).astype(jnp.float32)
+
+    tmp = sanitize(dot(dA_total, A.T), cfg.clip)
+    dAkk_raw = -dot(A.T, tmp) * (1.0 - wy_eps)
+    dAkk = dAkk_raw * strict
+
+    dk_from_kb = dkb_decayed * egc * b_c
+    db = dkb_decayed * egc * k_c
+    dgc_from_kb = dkb_decayed * kb_decayed * mgc
+
+    dx = dkg * kg
+    dk_from_kg = dkg * ekg
+    dgc_from_kg = -dx * mkg
+    dgc_last_contrib = jnp.sum(dx * mkg, axis=0)
+
+    dq = dqg * egc
+    dgc_from_qg = dqg * qg * mgc
+
+    dw = dwv * v_c
+    dv_raw = dwv * w_c
+
+    dk = dk_from_kb + dk_from_kg
+    dgc = dgc_from_kb + dgc_from_qg + dgc_from_kg
+
+    decay_h_row, mdec = exp_nonpos(gc_last)
+    dgc_last_from_decay = decay_h_row * jnp.sum(dh_next * h_pre, axis=-1) * mdec
+    dgc_last_total = dgc_last_contrib + dgc_last_from_decay
+    row_mask = (idx == (C - 1)).astype(jnp.float32)[:, None]
+    dgc = dgc + row_mask * dgc_last_total[None, :]
+
+    dq_ref[0, 0, 0] = sanitize(dq, cfg.clip)
+    dk_ref[0, 0, 0] = sanitize(dk, cfg.clip)
+    db_ref[0, 0, 0] = sanitize(db, cfg.clip)
+    dw_ref[0, 0, 0] = sanitize(dw, cfg.clip)
+    dvraw_ref[0, 0, 0] = sanitize(dv_raw, cfg.clip)
+    dgc_ref[0, 0, 0] = sanitize(dgc, cfg.clip)
+    dakk_ref[0, 0, 0] = sanitize(dAkk, cfg.clip)
+
+
+def wy_dqkg_backward_pallas(q, k, b, w, v, gc, A, h_pre, v_new, do, dv, dh_next,
+                            scale, cfg: BLRConfig):
+    bsz, H, nc, T, D = q.shape
+    _vmem_guard(cfg, vmem_kernel_b4(cfg, D) * 2, "Kernel B3 (Pallas)")  # грубая оценка, уточнить по факту
+    io = pl.BlockSpec((1, 1, 1, T, D), lambda i, h, c: (i, h, c, 0, 0))
+    sc = pl.BlockSpec((1, 1, 1, T, T), lambda i, h, c: (i, h, c, 0, 0))
+    hs = pl.BlockSpec((1, 1, 1, D, D), lambda i, h, c: (i, h, c, 0, 0))
+    out = pl.pallas_call(
+        lambda *r: _kernel_b3_body_pallas(*r, scale=scale, bt=T, wy_eps=cfg.wy_eps, cfg=cfg),
+        grid=(bsz, H, nc),
+        in_specs=[io, io, io, io, io, io, sc, hs, io, io, io, hs],
+        out_specs=[io, io, io, io, io, io, sc],
+        out_shape=[jax.ShapeDtypeStruct((bsz, H, nc, T, D), jnp.float32)] * 5
+        + [jax.ShapeDtypeStruct((bsz, H, nc, T, D), jnp.float32),
+           jax.ShapeDtypeStruct((bsz, H, nc, T, T), jnp.float32)],
+        compiler_params=_cparams(cfg.vmem_budget),
+        interpret=cfg.interpret,
+    )(q, k, b, w, v, gc, A, h_pre, v_new, do, dv, dh_next)
+    dq, dk, db, dw, dv_raw, dgc, dAkk = out
+    return dict(dq=dq, dk=dk, db=db, dw=dw, dv_raw=dv_raw, dgc=dgc, dAkk=dAkk) 
 # ===========================================================================
 # B4 -- BLR intra backward
 # ===========================================================================
