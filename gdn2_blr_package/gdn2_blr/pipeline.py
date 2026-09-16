@@ -37,13 +37,13 @@ from . import reference as R
 _FINAL_CLIP = 1e4
 
 
+# gdn2_blr/pipeline.py
 def _use_pallas(cfg: BLRConfig, stage: str) -> bool:
     if cfg.backend == "pallas":
         return True
     if cfg.backend == "xla":
         return False
-    return stage in ("A", "B", "D", "B1", "B4")   # hybrid
-
+    return stage in ("A", "B", "D", "B1", "B3", "B4")   # <-- B3 добавлен в hybrid
 
 # ---------------------------------------------------------------------------
 # forward со всеми residuals
@@ -77,7 +77,15 @@ def forward_with_residuals(q, k, v, w, b, g, scale, h0, cfg: BLRConfig):
     else:
         o_ch, h_final, hpre, vnew = R.inter_chunk_scan_ref(
             Aqk, wp, u, kg, qg, gc_last, scale, h0, cfg)
-
+    # backward_from_residuals -- заменить безусловный XLA-вызов на диспетчер
+    if _use_pallas(cfg, "B3"):
+        b3 = B.wy_dqkg_backward_pallas(
+            res["qr"], res["kr"], res["br"], res["wr"], res["vr"], gc, res["A"],
+            res["h_pre_all"], res["v_new_all"], do_r, dv_all, dh_next, scale, cfg)
+    else:
+        b3 = B.wy_dqkg_backward(
+            res["qr"], res["kr"], res["br"], res["wr"], res["vr"], gc, res["A"],
+            res["h_pre_all"], res["v_new_all"], do_r, dv_all, dh_next, scale, cfg)
     o = R.from_chunks(o_ch, bsz, nc, cfg.bt, H, D)
     res = dict(gc=gc, Aqk=Aqk, A=A, w_pseudo=wp, u=u, kg=kg, qg=qg,
                gc_last=gc_last, h_pre_all=hpre, v_new_all=vnew,
