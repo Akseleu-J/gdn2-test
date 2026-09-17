@@ -48,44 +48,39 @@ def _use_pallas(cfg: BLRConfig, stage: str) -> bool:
 # ---------------------------------------------------------------------------
 # forward со всеми residuals
 # ---------------------------------------------------------------------------
-def forward_with_residuals(q, k, v, w, b, g, scale, h0, cfg: BLRConfig):
+def forward_with_residuals_fixed(q, k, v, w, b, g, scale, h0, cfg):
+    '''Копия P.forward_with_residuals БЕЗ мёртвого B3-блока (который в
+    оригинале читает res/do_r/dv_all/dh_next до их создания). B3 -- это
+    backward-стадия и ей место только в backward_from_residuals_fixed.'''
     bsz, L, H, D = q.shape
     nc = L // cfg.bt
     qr, kr, vr, wr, br, gr = (R.to_chunks(t, bsz, nc, H, D, cfg.bt)
                               for t in (q, k, v, w, b, g))
     gc = R.chunk_gc(gr)
 
-    if _use_pallas(cfg, "A"):
+    if P._use_pallas(cfg, "A"):
         Aqk, Akk = F.build_scores(q, k, b, gc, scale, cfg)
     else:
         Aqk, Akk = R.blr_scores_ref(qr, kr, br, gc, scale, cfg)
 
-    if _use_pallas(cfg, "B"):
+    if P._use_pallas(cfg, "B"):
         A = F.wy_solve(Akk, cfg)
     else:
         A = sanitize(R.ladder_inverse(Akk, cfg.wy_eps, cfg.bt, cfg.mb,
                                       cfg.solve_dot_mode), cfg.clip)
 
-    if _use_pallas(cfg, "C"):
+    if P._use_pallas(cfg, "C"):
         wp, u, kg, qg, gc_last = F.recompute_wy(q, k, v, w, b, gc, A, cfg)
     else:
         wp, u, kg, qg, gc_last = R.recompute_wy_ref(qr, kr, vr, wr, br, gc, A, cfg)
 
-    if _use_pallas(cfg, "D"):
+    if P._use_pallas(cfg, "D"):
         o_ch, h_final, hpre, vnew = F.inter_chunk_scan(
             Aqk, wp, u, kg, qg, gc_last, scale, h0, cfg)
     else:
         o_ch, h_final, hpre, vnew = R.inter_chunk_scan_ref(
             Aqk, wp, u, kg, qg, gc_last, scale, h0, cfg)
-    # backward_from_residuals -- заменить безусловный XLA-вызов на диспетчер
-    if _use_pallas(cfg, "B3"):
-        b3 = B.wy_dqkg_backward_pallas(
-            res["qr"], res["kr"], res["br"], res["wr"], res["vr"], gc, res["A"],
-            res["h_pre_all"], res["v_new_all"], do_r, dv_all, dh_next, scale, cfg)
-    else:
-        b3 = B.wy_dqkg_backward(
-            res["qr"], res["kr"], res["br"], res["wr"], res["vr"], gc, res["A"],
-            res["h_pre_all"], res["v_new_all"], do_r, dv_all, dh_next, scale, cfg)
+
     o = R.from_chunks(o_ch, bsz, nc, cfg.bt, H, D)
     res = dict(gc=gc, Aqk=Aqk, A=A, w_pseudo=wp, u=u, kg=kg, qg=qg,
                gc_last=gc_last, h_pre_all=hpre, v_new_all=vnew,
