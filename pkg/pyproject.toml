@@ -1,0 +1,8 @@
+[project]
+name = "atomic-gdn2"
+version = "0.2.0"
+requires-python = ">=3.10"
+dependencies = ["jax", "optax", "numpy"]
+[tool.pytest.ini_options]
+markers = ["slow: tiny training smoke"]
+testpaths = ["tests"]
